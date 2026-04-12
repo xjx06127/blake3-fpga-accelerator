@@ -60,9 +60,9 @@ LDFLAGS += -L$(XILINX_XRT)/lib -pthread -lOpenCL
 PLATFORM_BLOCKLIST += nodma 
 ############################## Setting up Host Variables ##############################
 #Include Required Host Source Files
-CXXFLAGS += -I$(XF_PROJ_ROOT)/common/includes/cmdparser
-CXXFLAGS += -I$(XF_PROJ_ROOT)/common/includes/logger
-HOST_SRCS += $(XF_PROJ_ROOT)/common/includes/cmdparser/cmdlineparser.cpp $(XF_PROJ_ROOT)/common/includes/logger/logger.cpp ./src/host.cpp 
+CXXFLAGS += -I./common/includes/cmdparser
+CXXFLAGS += -I./common/includes/logger
+HOST_SRCS += ./common/includes/cmdparser/cmdlineparser.cpp ./common/includes/logger/logger.cpp ./src/host.cpp 
 # Host compiler global settings
 CXXFLAGS += -fmessage-length=0
 LDFLAGS += -lrt -lstdc++ 

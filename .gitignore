@@ -1,0 +1,35 @@
+# --- 빌드 결과물 및 대용량 폴더 ---
+_x/
+_x.*/
+build_dir.*/
+package.*/
+.Xil/
+.ipcache/
+.run/
+analyzer_input/
+
+# --- 실행 파일 및 바이너리 ---
+blake3_xrt
+*.xo
+*.xclbin
+
+# --- 로그 및 백업 파일 ---
+*.log
+v++_*.log
+v++_*.backup.log
+xilinx_u55c_gen3x16_xdma_3_202210_1-*.log
+xcd.log
+emulation_debug.log
+
+# --- 분석 및 결과 리포트 ---
+*.csv
+xrt.run_summary
+qor.json
+emconfig.json
+native_trace.csv
+summary.csv
+
+# --- 에디터 및 시스템 파일 ---
+*.swp
+*.swo
+.DS_Store
