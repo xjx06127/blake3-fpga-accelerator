@@ -2,10 +2,35 @@
 #include <hls_stream.h>
 #include <hls_vector.h>
 
-#define CHUNK_START 1 << 0
-#define CHUNK_END 1 << 1
-#define PARENT 1 << 2
-#define ROOT 1 << 3
+#define CHUNK_START (1 << 0)
+#define CHUNK_END (1 << 1)
+#define PARENT (1 << 2)
+#define ROOT (1 << 3)
+
+// ─── BLAKE3 알고리즘 스펙 상수 ─────────────────────────────────────────
+const int WORDS_PER_CV      = 8; //CV는 32B = 32b(1 word) * 8
+const int WORDS_PER_BLOCK   = 16;
+const int BLOCK_BYTES       = 64;
+
+// ─── HW 아키텍처 및 파이프라인 상수 ──────────────────────────────────────
+const int NUM_ENGINES       = 4;  // 총 PE 쌍 개수
+const int CHUNKS_PER_ENGINE = 32; // 엔진당 한 pass에 처리하는 청크 수
+const int BLOCKS_PER_CHUNK  = 16; // 청크 당 블락 수 
+
+const int CHUNKS_PER_PASS   = NUM_ENGINES * CHUNKS_PER_ENGINE;      // 128 청크
+const int BLOCKS_PER_PE     = CHUNKS_PER_ENGINE * BLOCKS_PER_CHUNK; // 512 블록
+
+const int MAX_PASSES        = 32; // 최대 4096청크(4MB) input 지원
+const int MAX_FINAL_NODES   = MAX_PASSES * 2;
+const int MAX_FINAL_STAGES  = 6;  // 최대 64노드 트리 병합
+const int CV_PE_STAGES      = 6;  // Pass 내 트리 병합 단계 (마지막 2개 노드 남김)
+
+// ─── 프라그마 전용 스트림 및 AXI Depth 상수 ──────────────────────────────
+const int AXI_DEPTH_IN        = BLOCKS_PER_PE * 2; // 그때그때 바꾸기
+const int AXI_DEPTH_OUT       = 1;
+const int FIFO_DEPTH_D2C      = 4;
+const int FIFO_DEPTH_C2CV     = 32;
+const int FIFO_DEPTH_CV2FINAL = 4;
 
 typedef hls::vector<uint32_t, 16> block_vec_t;
 typedef hls::vector<uint32_t, 8>  cv_vec_t;
@@ -150,7 +175,8 @@ inline static void compress(const uint32_t chaining_value[8],
 }
 
 void parent_cv(const cv_vec_t& left, const cv_vec_t& right, uint32_t flags, cv_vec_t& out_cv) {
-    #pragma HLS INLINE OFF //for resource saving. not allowed to copy too many compress
+    #pragma HLS INLINE OFF //for resource saving. not allowed to copy too many compress.
+    /// 이거 없으면 parent_cv가 unroll때 복제되어버려서 사이클 10개 아끼려서 리소스 몇배 낭비
 
     uint32_t block_words[16];
     #pragma HLS ARRAY_PARTITION variable=block_words complete
@@ -175,134 +201,255 @@ void parent_cv(const cv_vec_t& left, const cv_vec_t& right, uint32_t flags, cv_v
     }
 }
 
-void dispatcher_pe(const block_vec_t* ext_mem, hls::stream<internal_pkt>& out_fifo) {
+void dispatcher_pe(const block_vec_t* ext_mem, hls::stream<internal_pkt>& out_fifo, uint32_t chunk_offset_base, uint32_t num_passes) {
+    for (uint32_t p = 0; p < num_passes; p++) {
+        #pragma HLS LOOP_TRIPCOUNT min=1 max=2
+        
+        uint32_t chunk_offset = chunk_offset_base + p * CHUNKS_PER_PASS;
+        
+        block_vec_t local_buffer[BLOCKS_PER_PE];
 
-    block_vec_t local_buffer[512];
+        for (int i = 0; i < BLOCKS_PER_PE; i++) {
+            #pragma HLS PIPELINE II=1
+            local_buffer[i] = ext_mem[p * BLOCKS_PER_PE + i]; 
+        }
 
-    for (int i = 0; i < 512; i++) {
-        #pragma HLS PIPELINE II=1
-        local_buffer[i] = ext_mem[i];
-    }
-
-    // for interleaving dispatching
-    for (int i = 0; i < 512; i++) {
-        #pragma HLS PIPELINE II=1
-        
-        int block_idx = i / 32; 
-        int chunk_idx = i % 32;
-        
-        int local_addr = (chunk_idx * 16) + block_idx;
-        
-        internal_pkt pkt;
-        pkt.data = local_buffer[local_addr]; 
-        pkt.chunk_idx = chunk_idx;
-        
-        pkt.flags = 0;
-        if (block_idx == 0)  pkt.flags |= CHUNK_START;
-        if (block_idx == 15) pkt.flags |= CHUNK_END;
-        
-        out_fifo.write(pkt);
+        for (int i = 0; i < BLOCKS_PER_PE; i++) {
+            #pragma HLS PIPELINE II=1
+            
+            int block_idx = i / 32;
+            int chunk_idx = i % 32;
+            int local_addr = (chunk_idx * 16) + block_idx;
+            
+            internal_pkt pkt;
+            pkt.data = local_buffer[local_addr]; 
+            pkt.chunk_idx = chunk_offset + chunk_idx;
+            
+            pkt.flags = 0;
+            if (block_idx == 0)  pkt.flags |= CHUNK_START;
+            if (block_idx == 15) pkt.flags |= CHUNK_END;
+            
+            out_fifo.write(pkt);
+        }
     }
 }
 
-void comp_pe(hls::stream<internal_pkt>& in_fifo, hls::stream<cv_vec_t>& out_cv_fifo) {
+void comp_pe(hls::stream<internal_pkt>& in_fifo, hls::stream<cv_vec_t>& out_cv_fifo, uint32_t num_passes) {
+    // latency = 32*16+31 = 543
+    // interval = 512 --> 512개 루프 끝나면 바로 다음꺼 먹을 수 있음. 32개 청크 무한 섭취 가능
+    // 0 사이클에서 처음 comp_pe에 input으로 블락 들어간다할때, 511 사이클에서 처음 FIFO에 write
+    // 32개 청크 무한 섭취 가능하지만, 첫 32개 청크 다 넣고, 두번째 청크 들어간 후 511 사이클지나도
+    // cv_pe에서 압축이 안되면 문제가 된다 --> FIFO를 충분히 깊게 or cv_pe가 무조건 511 사이클보다 적도록
     cv_vec_t cv_mem[32];
     // array for temporary cv
 
-    for (int i = 0; i < 512; i++) {
-        #pragma HLS PIPELINE II=1
-        #pragma HLS dependence variable=cv_mem type=inter false
-        
-        internal_pkt pkt = in_fifo.read();
-        uint8_t local_chunk_idx = pkt.chunk_idx % 32;
-        
-        uint32_t cv_in[8];
-        #pragma HLS ARRAY_PARTITION variable=cv_in complete
 
-        if (pkt.flags & CHUNK_START) {
-            for (int j = 0; j < 8; j++) {
-            #pragma HLS UNROLL    
-                cv_in[j] = IV[j];
-            }
-        } else {
-            for (int j = 0; j < 8; j++) {
-            #pragma HLS UNROLL
-                cv_in[j] = cv_mem[local_chunk_idx][j];
-            }
-        }
-
-        uint32_t msg[16];
-        #pragma HLS ARRAY_PARTITION variable=msg complete
-
-        for (int j = 0; j < 16; j++) {
-        #pragma HLS UNROLL
-            msg[j] = pkt.data[j];
-        }
-
-        uint32_t res16[16];
-        #pragma HLS ARRAY_PARTITION variable=res16 complete
-
-        compress(cv_in, msg, pkt.chunk_idx, 64, pkt.flags, res16);
-
-        cv_vec_t out_cv;
-
-        for (int j = 0; j < 8; j++){
-            #pragma HLS UNROLL
-            out_cv[j] = res16[j];
-        }
-
-        if (pkt.flags & CHUNK_END) {
-            out_cv_fifo.write(out_cv);
-        } else {
-            cv_mem[local_chunk_idx] = out_cv;
-        }
-    }
-}
-void cv_pe(hls::stream<cv_vec_t>& in_cv_fifo, cv_vec_t* ext_out) {
-
-    cv_vec_t buf[2][32];
-    #pragma HLS ARRAY_PARTITION variable=buf complete
-
-    for (int i = 0; i < 32; i++) {
-        #pragma HLS PIPELINE II=1
-        buf[0][i] = in_cv_fifo.read();
-    }
-
-    // 5 level tree merging(32chunks need 31 merging, which means 5 level tree)
-    for (int level = 0; level < 5; level++) {
-        #pragma HLS UNROLL // for level parallelism
-        
-        int src = level % 2;
-        int dst = 1 - src;
-        int merges = 16 >> level; 
-        
-        for (int i = 0; i < merges; i++) {
+    for (uint32_t p = 0; p < num_passes; p++) {
+        #pragma HLS LOOP_TRIPCOUNT min=1 max=2
+        for (int i = 0; i < BLOCKS_PER_PE; i++) {
             #pragma HLS PIPELINE II=1
+            #pragma HLS dependence variable=cv_mem type=inter false
             
-            uint32_t flag = (merges == 1) ? ROOT : 0;
-            cv_vec_t parent_out; 
+            internal_pkt pkt = in_fifo.read();
+            uint8_t local_chunk_idx = pkt.chunk_idx % 32;
             
-            parent_cv(buf[src][2*i], buf[src][2*i+1], flag, parent_out);
-            
-            buf[dst][i] = parent_out; 
+            uint32_t cv_in[8];
+            #pragma HLS ARRAY_PARTITION variable=cv_in complete
+
+            if (pkt.flags & CHUNK_START) {
+                for (int j = 0; j < WORDS_PER_CV; j++) {
+                #pragma HLS UNROLL    
+                    cv_in[j] = IV[j];
+                }
+            } else {
+                for (int j = 0; j < WORDS_PER_CV; j++) {
+                #pragma HLS UNROLL
+                    cv_in[j] = cv_mem[local_chunk_idx][j];
+                }
+            }
+
+            uint32_t msg[16];
+            #pragma HLS ARRAY_PARTITION variable=msg complete
+
+            for (int j = 0; j < WORDS_PER_BLOCK; j++) {
+            #pragma HLS UNROLL
+                msg[j] = pkt.data[j];
+            }
+
+            uint32_t res16[16];
+            #pragma HLS ARRAY_PARTITION variable=res16 complete
+
+            compress(cv_in, msg, pkt.chunk_idx, 64, pkt.flags, res16);
+
+            cv_vec_t out_cv;
+
+            for (int j = 0; j < WORDS_PER_CV; j++){
+                #pragma HLS UNROLL
+                out_cv[j] = res16[j];
+            }
+
+            if (pkt.flags & CHUNK_END) {
+                out_cv_fifo.write(out_cv);
+            } else {
+                cv_mem[local_chunk_idx] = out_cv;
+            }
         }
     }
-
-    ext_out[0] = buf[1][0];
 }
 
-extern "C"{
-void blake3(const block_vec_t* host_data_in, cv_vec_t* host_hash_out) {
-    #pragma HLS INTERFACE m_axi port=host_data_in  depth=512 bundle=gmem0
-    #pragma HLS INTERFACE m_axi port=host_hash_out depth=1 bundle=gmem1
+void cv_pe(hls::stream<cv_vec_t>& in_cv_fifo_0,
+           hls::stream<cv_vec_t>& in_cv_fifo_1,
+           hls::stream<cv_vec_t>& in_cv_fifo_2,
+           hls::stream<cv_vec_t>& in_cv_fifo_3,
+           hls::stream<cv_vec_t>& out_cv_fifo,
+           uint32_t num_passes) {
+    
+    // 레벨별로는 후반에 가면 디펜던시 생기니까 outer loop는 파이프라이닝 하지 않는 것이 중요
 
-    hls::stream<internal_pkt> disp_to_comp("disp_to_comp"); // probably should specify the depth cuz of deadlock   
-    hls::stream<cv_vec_t> comp_to_cv("comp_to_cv");
-    #pragma HLS STREAM variable=comp_to_cv depth=32
+    for (uint32_t p = 0; p < num_passes; p++) {
+        #pragma HLS LOOP_TRIPCOUNT min=1 max=2
+        cv_vec_t buf[4][32];
+        // 첫 번째 차원(4)을 완전 분할 -> 4개의 FIFO 동시 쓰기(stride=32) 충돌 해결
+        #pragma HLS ARRAY_PARTITION variable=buf complete dim=1
+        // 두 번째 차원(32)을 짝/홀로 분할 -> 트리 병합 시 2i, 2i+1 동시 읽기 충돌 해결
+        #pragma HLS ARRAY_PARTITION variable=buf cyclic factor=2 dim=2
+
+        for (int i = 0; i < CHUNKS_PER_ENGINE; i++) {
+            #pragma HLS PIPELINE II=1
+            buf[0][i] = in_cv_fifo_0.read();
+            buf[1][i] = in_cv_fifo_1.read();
+            buf[2][i] = in_cv_fifo_2.read();
+            buf[3][i] = in_cv_fifo_3.read();
+        }
+        
+        for (int stage = 0; stage < CV_PE_STAGES; stage++) {
+            // stage 0이면 가장 트리의 맨 아래부터 시작
+            // stage 5일때, 루트 노드 이전의 노드 2개 만듦 (num_pass가 1일때도 ROOT FLAG를 cv_final_pe에서 하도록)
+            #pragma HLS UNROLL // 없으면 동적 변수인 merging_cnt 보수적으로 잡아서 내부 for문에서. 64로 고정되어버림. --> 사이클 폭증
+            int merging_cnt = ((CHUNKS_PER_PASS / 2) >> stage);
+            
+            for (int i = 0; i < merging_cnt; i++) {
+                #pragma HLS PIPELINE II=1
+                #pragma HLS dependence variable=buf type=inter false
+                
+                int left_idx = 2 * i;
+                int right_idx = 2 * i + 1;
+                
+                int left_row  = left_idx / 32;
+                int left_col  = left_idx % 32;
+                
+                int right_row = right_idx / 32;
+                int right_col = right_idx % 32;
+                
+                int out_row   = i / 32;
+                int out_col   = i % 32;
+                
+                cv_vec_t left  = buf[left_row][left_col];
+                cv_vec_t right = buf[right_row][right_col];
+                
+                cv_vec_t merged_cv;
+                parent_cv(left, right, 0, merged_cv);
+                
+                buf[out_row][out_col] = merged_cv;
+            }
+        }
+        out_cv_fifo.write(buf[0][0]);
+        out_cv_fifo.write(buf[0][1]);
+    }
+}
+
+void cv_pe_final(hls::stream<cv_vec_t>& in_cv_fifo, 
+                 uint32_t num_passes, 
+                 cv_vec_t* ext_out) {
+                 
+    cv_vec_t buf[MAX_FINAL_NODES];
+    #pragma HLS ARRAY_PARTITION variable=buf cyclic factor=2 dim=1
+
+    // 1. 필요한 노드를 모두 모을 때까지 대기
+    int actual_nodes = num_passes * 2;
+    for (int i = 0; i < actual_nodes; i++) {
+        #pragma HLS LOOP_TRIPCOUNT min=2 max=4
+        #pragma HLS PIPELINE II=1
+        buf[i] = in_cv_fifo.read();
+    }
+
+    // 2. 일괄 병합 (고정된 트리 구조)
+    for (int stage = 0; stage < MAX_FINAL_STAGES; stage++) {
+        #pragma HLS UNROLL
+        int max_merges    = MAX_FINAL_NODES >> (stage + 1); 
+        int actual_merges = actual_nodes >> (stage + 1); 
+
+        for (int i = 0; i < max_merges; i++) {
+            #pragma HLS PIPELINE II=1
+            #pragma HLS dependence variable=buf type=inter false
+
+            if (i < actual_merges) {
+                // 이 병합이 트리의 마지막인지 판단하여 ROOT 플래그 적용
+                bool is_root = (actual_merges == 1) && (i == 0);
+                uint32_t flag = is_root ? ROOT : 0;
+
+                cv_vec_t left  = buf[2 * i];
+                cv_vec_t right = buf[2 * i + 1];
+                cv_vec_t merged_cv;
+                parent_cv(left, right, flag, merged_cv);
+                buf[i] = merged_cv;
+            }
+        }
+    }
+    ext_out[0] = buf[0];
+}
+
+void blake3_accelerator(const block_vec_t* host_data_in_0,
+            const block_vec_t* host_data_in_1,
+            const block_vec_t* host_data_in_2,
+            const block_vec_t* host_data_in_3,
+            uint32_t  num_chunks,
+            cv_vec_t* host_hash_out) {
+    #pragma HLS INTERFACE m_axi port=host_data_in_0 depth=AXI_DEPTH_IN bundle=gmem0
+    #pragma HLS INTERFACE m_axi port=host_data_in_1 depth=AXI_DEPTH_IN bundle=gmem1
+    #pragma HLS INTERFACE m_axi port=host_data_in_2 depth=AXI_DEPTH_IN bundle=gmem2
+    #pragma HLS INTERFACE m_axi port=host_data_in_3 depth=AXI_DEPTH_IN bundle=gmem3
+    #pragma HLS INTERFACE m_axi port=host_hash_out  depth=AXI_DEPTH_OUT   bundle=gmem4
+
+    uint32_t num_passes = num_chunks / CHUNKS_PER_PASS;
+
+    hls::stream<internal_pkt> disp_to_comp_0("disp_to_comp_0");
+    hls::stream<internal_pkt> disp_to_comp_1("disp_to_comp_1");
+    hls::stream<internal_pkt> disp_to_comp_2("disp_to_comp_2");
+    hls::stream<internal_pkt> disp_to_comp_3("disp_to_comp_3");
+
+    #pragma HLS STREAM variable=disp_to_comp_0 depth=FIFO_DEPTH_D2C
+    #pragma HLS STREAM variable=disp_to_comp_1 depth=FIFO_DEPTH_D2C
+    #pragma HLS STREAM variable=disp_to_comp_2 depth=FIFO_DEPTH_D2C
+    #pragma HLS STREAM variable=disp_to_comp_3 depth=FIFO_DEPTH_D2C
+
+    hls::stream<cv_vec_t> comp_to_cv_0("comp_to_cv_0");
+    hls::stream<cv_vec_t> comp_to_cv_1("comp_to_cv_1");
+    hls::stream<cv_vec_t> comp_to_cv_2("comp_to_cv_2");
+    hls::stream<cv_vec_t> comp_to_cv_3("comp_to_cv_3");
+
+    #pragma HLS STREAM variable=comp_to_cv_0 depth=FIFO_DEPTH_C2CV
+    #pragma HLS STREAM variable=comp_to_cv_1 depth=FIFO_DEPTH_C2CV
+    #pragma HLS STREAM variable=comp_to_cv_2 depth=FIFO_DEPTH_C2CV
+    #pragma HLS STREAM variable=comp_to_cv_3 depth=FIFO_DEPTH_C2CV
+
+    hls::stream<cv_vec_t> cv_pe_to_cv_final("cv_pe_to_cv_final");
+    #pragma HLS STREAM variable=cv_pe_to_cv_final depth=FIFO_DEPTH_CV2FINAL
 
     #pragma HLS DATAFLOW
-    dispatcher_pe(host_data_in, disp_to_comp);
-    comp_pe(disp_to_comp, comp_to_cv);
-    cv_pe(comp_to_cv, host_hash_out);
-}
+    dispatcher_pe(host_data_in_0, disp_to_comp_0, 0,  num_passes);
+    dispatcher_pe(host_data_in_1, disp_to_comp_1, 32, num_passes);
+    dispatcher_pe(host_data_in_2, disp_to_comp_2, 64, num_passes);
+    dispatcher_pe(host_data_in_3, disp_to_comp_3, 96, num_passes);
+
+    comp_pe(disp_to_comp_0, comp_to_cv_0, num_passes);
+    comp_pe(disp_to_comp_1, comp_to_cv_1, num_passes);
+    comp_pe(disp_to_comp_2, comp_to_cv_2, num_passes);
+    comp_pe(disp_to_comp_3, comp_to_cv_3, num_passes);
+    
+    cv_pe(comp_to_cv_0, comp_to_cv_1, 
+            comp_to_cv_2, comp_to_cv_3, 
+            cv_pe_to_cv_final, num_passes);
+
+    cv_pe_final(cv_pe_to_cv_final, num_passes, host_hash_out);
 }
