@@ -7,15 +7,10 @@
 #define PARENT (1 << 2)
 #define ROOT (1 << 3)
 
-// ─── BLAKE3 알고리즘 스펙 상수 ─────────────────────────────────────────
-const int WORDS_PER_CV      = 8; //CV는 32B = 32b(1 word) * 8
-const int WORDS_PER_BLOCK   = 16;
-const int BLOCK_BYTES       = 64;
-
 // ─── HW 아키텍처 및 파이프라인 상수 ──────────────────────────────────────
-const int NUM_ENGINES       = 4;  // 총 PE 쌍 개수
+const int NUM_ENGINES       = 4;  // 총 PE 쌍 개수(dispatcher-comp)
 const int CHUNKS_PER_ENGINE = 32; // 엔진당 한 pass에 처리하는 청크 수
-const int BLOCKS_PER_CHUNK  = 16; // 청크 당 블락 수 
+const int BLOCKS_PER_CHUNK  = 16; // 청크 당 블락 수
 
 const int CHUNKS_PER_PASS   = NUM_ENGINES * CHUNKS_PER_ENGINE;      // 128 청크
 const int BLOCKS_PER_PE     = CHUNKS_PER_ENGINE * BLOCKS_PER_CHUNK; // 512 블록
@@ -217,9 +212,9 @@ void dispatcher_pe(const block_vec_t* ext_mem, hls::stream<internal_pkt>& out_fi
         for (int i = 0; i < BLOCKS_PER_PE; i++) {
             #pragma HLS PIPELINE II=1
             
-            int block_idx = i / 32;
-            int chunk_idx = i % 32;
-            int local_addr = (chunk_idx * 16) + block_idx;
+            int block_idx = i / CHUNKS_PER_ENGINE;
+            int chunk_idx = i % CHUNKS_PER_ENGINE;
+            int local_addr = (chunk_idx * BLOCKS_PER_CHUNK) + block_idx;
             
             internal_pkt pkt;
             pkt.data = local_buffer[local_addr]; 
@@ -240,7 +235,7 @@ void comp_pe(hls::stream<internal_pkt>& in_fifo, hls::stream<cv_vec_t>& out_cv_f
     // 0 사이클에서 처음 comp_pe에 input으로 블락 들어간다할때, 511 사이클에서 처음 FIFO에 write
     // 32개 청크 무한 섭취 가능하지만, 첫 32개 청크 다 넣고, 두번째 청크 들어간 후 511 사이클지나도
     // cv_pe에서 압축이 안되면 문제가 된다 --> FIFO를 충분히 깊게 or cv_pe가 무조건 511 사이클보다 적도록
-    cv_vec_t cv_mem[32];
+    cv_vec_t cv_mem[CHUNKS_PER_ENGINE];
     // array for temporary cv
 
 
@@ -251,18 +246,18 @@ void comp_pe(hls::stream<internal_pkt>& in_fifo, hls::stream<cv_vec_t>& out_cv_f
             #pragma HLS dependence variable=cv_mem type=inter false
             
             internal_pkt pkt = in_fifo.read();
-            uint8_t local_chunk_idx = pkt.chunk_idx % 32;
+            uint8_t local_chunk_idx = pkt.chunk_idx % CHUNKS_PER_ENGINE;
             
             uint32_t cv_in[8];
             #pragma HLS ARRAY_PARTITION variable=cv_in complete
 
             if (pkt.flags & CHUNK_START) {
-                for (int j = 0; j < WORDS_PER_CV; j++) {
+                for (int j = 0; j < 8; j++) {
                 #pragma HLS UNROLL    
                     cv_in[j] = IV[j];
                 }
             } else {
-                for (int j = 0; j < WORDS_PER_CV; j++) {
+                for (int j = 0; j < 8; j++) {
                 #pragma HLS UNROLL
                     cv_in[j] = cv_mem[local_chunk_idx][j];
                 }
@@ -271,7 +266,7 @@ void comp_pe(hls::stream<internal_pkt>& in_fifo, hls::stream<cv_vec_t>& out_cv_f
             uint32_t msg[16];
             #pragma HLS ARRAY_PARTITION variable=msg complete
 
-            for (int j = 0; j < WORDS_PER_BLOCK; j++) {
+            for (int j = 0; j < 16; j++) {
             #pragma HLS UNROLL
                 msg[j] = pkt.data[j];
             }
@@ -283,7 +278,7 @@ void comp_pe(hls::stream<internal_pkt>& in_fifo, hls::stream<cv_vec_t>& out_cv_f
 
             cv_vec_t out_cv;
 
-            for (int j = 0; j < WORDS_PER_CV; j++){
+            for (int j = 0; j < 8; j++){
                 #pragma HLS UNROLL
                 out_cv[j] = res16[j];
             }
@@ -308,7 +303,7 @@ void cv_pe(hls::stream<cv_vec_t>& in_cv_fifo_0,
 
     for (uint32_t p = 0; p < num_passes; p++) {
         #pragma HLS LOOP_TRIPCOUNT min=1 max=2
-        cv_vec_t buf[4][32];
+        cv_vec_t buf[NUM_ENGINES][CHUNKS_PER_ENGINE];
         // 첫 번째 차원(4)을 완전 분할 -> 4개의 FIFO 동시 쓰기(stride=32) 충돌 해결
         #pragma HLS ARRAY_PARTITION variable=buf complete dim=1
         // 두 번째 차원(32)을 짝/홀로 분할 -> 트리 병합 시 2i, 2i+1 동시 읽기 충돌 해결
@@ -326,7 +321,7 @@ void cv_pe(hls::stream<cv_vec_t>& in_cv_fifo_0,
             // stage 0이면 가장 트리의 맨 아래부터 시작
             // stage 5일때, 루트 노드 이전의 노드 2개 만듦 (num_pass가 1일때도 ROOT FLAG를 cv_final_pe에서 하도록)
             #pragma HLS UNROLL // 없으면 동적 변수인 merging_cnt 보수적으로 잡아서 내부 for문에서. 64로 고정되어버림. --> 사이클 폭증
-            int merging_cnt = ((CHUNKS_PER_PASS / 2) >> stage);
+            int merging_cnt = (CHUNKS_PER_PASS >> (stage + 1));
             
             for (int i = 0; i < merging_cnt; i++) {
                 #pragma HLS PIPELINE II=1
@@ -335,14 +330,14 @@ void cv_pe(hls::stream<cv_vec_t>& in_cv_fifo_0,
                 int left_idx = 2 * i;
                 int right_idx = 2 * i + 1;
                 
-                int left_row  = left_idx / 32;
-                int left_col  = left_idx % 32;
+                int left_row  = left_idx / CHUNKS_PER_ENGINE;
+                int left_col  = left_idx % CHUNKS_PER_ENGINE;
                 
-                int right_row = right_idx / 32;
-                int right_col = right_idx % 32;
+                int right_row = right_idx / CHUNKS_PER_ENGINE;
+                int right_col = right_idx % CHUNKS_PER_ENGINE;
                 
-                int out_row   = i / 32;
-                int out_col   = i % 32;
+                int out_row   = i / CHUNKS_PER_ENGINE;
+                int out_col   = i % CHUNKS_PER_ENGINE;
                 
                 cv_vec_t left  = buf[left_row][left_col];
                 cv_vec_t right = buf[right_row][right_col];
@@ -376,8 +371,8 @@ void cv_pe_final(hls::stream<cv_vec_t>& in_cv_fifo,
     // 2. 일괄 병합 (고정된 트리 구조)
     for (int stage = 0; stage < MAX_FINAL_STAGES; stage++) {
         #pragma HLS UNROLL
-        int max_merges    = MAX_FINAL_NODES >> (stage + 1); 
-        int actual_merges = actual_nodes >> (stage + 1); 
+        int max_merges    = (MAX_FINAL_NODES >> (stage + 1)); 
+        int actual_merges = (actual_nodes >> (stage + 1)); 
 
         for (int i = 0; i < max_merges; i++) {
             #pragma HLS PIPELINE II=1
@@ -403,8 +398,8 @@ void blake3_accelerator(const block_vec_t* host_data_in_0,
             const block_vec_t* host_data_in_1,
             const block_vec_t* host_data_in_2,
             const block_vec_t* host_data_in_3,
-            uint32_t  num_chunks,
-            cv_vec_t* host_hash_out) {
+            cv_vec_t* host_hash_out,
+            uint32_t  num_chunks) {
     #pragma HLS INTERFACE m_axi port=host_data_in_0 depth=AXI_DEPTH_IN bundle=gmem0
     #pragma HLS INTERFACE m_axi port=host_data_in_1 depth=AXI_DEPTH_IN bundle=gmem1
     #pragma HLS INTERFACE m_axi port=host_data_in_2 depth=AXI_DEPTH_IN bundle=gmem2
@@ -437,19 +432,17 @@ void blake3_accelerator(const block_vec_t* host_data_in_0,
     #pragma HLS STREAM variable=cv_pe_to_cv_final depth=FIFO_DEPTH_CV2FINAL
 
     #pragma HLS DATAFLOW
-    dispatcher_pe(host_data_in_0, disp_to_comp_0, 0,  num_passes);
-    dispatcher_pe(host_data_in_1, disp_to_comp_1, 32, num_passes);
-    dispatcher_pe(host_data_in_2, disp_to_comp_2, 64, num_passes);
-    dispatcher_pe(host_data_in_3, disp_to_comp_3, 96, num_passes);
+    dispatcher_pe(host_data_in_0, disp_to_comp_0, 0 * CHUNKS_PER_ENGINE,  num_passes);
+    dispatcher_pe(host_data_in_1, disp_to_comp_1, 1 * CHUNKS_PER_ENGINE, num_passes);
+    dispatcher_pe(host_data_in_2, disp_to_comp_2, 2 * CHUNKS_PER_ENGINE, num_passes);
+    dispatcher_pe(host_data_in_3, disp_to_comp_3, 3 * CHUNKS_PER_ENGINE, num_passes);
 
     comp_pe(disp_to_comp_0, comp_to_cv_0, num_passes);
     comp_pe(disp_to_comp_1, comp_to_cv_1, num_passes);
     comp_pe(disp_to_comp_2, comp_to_cv_2, num_passes);
     comp_pe(disp_to_comp_3, comp_to_cv_3, num_passes);
     
-    cv_pe(comp_to_cv_0, comp_to_cv_1, 
-            comp_to_cv_2, comp_to_cv_3, 
-            cv_pe_to_cv_final, num_passes);
+    cv_pe(comp_to_cv_0, comp_to_cv_1, comp_to_cv_2, comp_to_cv_3, cv_pe_to_cv_final, num_passes);
 
     cv_pe_final(cv_pe_to_cv_final, num_passes, host_hash_out);
 }

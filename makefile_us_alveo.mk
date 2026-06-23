@@ -48,11 +48,11 @@ include ./utils.mk
 TEMP_DIR := ./_x.$(TARGET).$(XSA)
 BUILD_DIR := ./build_dir.$(TARGET).$(XSA)
 
-LINK_OUTPUT := $(BUILD_DIR)/blake3.link.xclbin
+LINK_OUTPUT := $(BUILD_DIR)/blake3_accelerator.link.xclbin
 PACKAGE_OUT = ./package.$(TARGET)
 
 VPP_PFLAGS := 
-CMD_ARGS = -x $(BUILD_DIR)/blake3.xclbin
+CMD_ARGS = -x $(BUILD_DIR)/blake3_accelerator.xclbin
 CXXFLAGS += -I$(XILINX_XRT)/include -I$(XILINX_VIVADO)/include -Wall -O0 -g -std=c++17
 LDFLAGS += -L$(XILINX_XRT)/lib -pthread -lOpenCL
 
@@ -71,34 +71,37 @@ LDFLAGS += -luuid -lxrt_coreutil
 ############################## Setting up Kernel Variables ##############################
 # Kernel compiler global settings
 VPP_FLAGS += --save-temps
-VPP_LDFLAGS += --connectivity.sp blake3_1.host_data_in:HBM[0]
-VPP_LDFLAGS += --connectivity.sp blake3_1.host_hash_out:HBM[1]
+VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_data_in_0:HBM[0]
+VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_data_in_1:HBM[1]
+VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_data_in_2:HBM[2]
+VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_data_in_3:HBM[3]
+VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_hash_out:HBM[4]
 
-EXECUTABLE = ./blake3_xrt
+EXECUTABLE = ./blake3_accelerator_xrt
 EMCONFIG_DIR = $(TEMP_DIR)
 
 ############################## Setting Targets ##############################
 .PHONY: all clean cleanall docs emconfig
-all: check-platform check-device check-vitis $(EXECUTABLE) $(BUILD_DIR)/blake3.xclbin emconfig
+all: check-platform check-device check-vitis $(EXECUTABLE) $(BUILD_DIR)/blake3_accelerator.xclbin emconfig
 
 .PHONY: host
 host: $(EXECUTABLE)
 
 .PHONY: build
-build: check-vitis check-device $(BUILD_DIR)/blake3.xclbin
+build: check-vitis check-device $(BUILD_DIR)/blake3_accelerator.xclbin
 
 .PHONY: xclbin
 xclbin: build
 
 ############################## Setting Rules for Binary Containers (Building Kernels) ##############################
-$(TEMP_DIR)/blake3.xo: src/blake3.cpp
+$(TEMP_DIR)/blake3_accelerator.xo: src/blake3_accelerator.cpp
 	mkdir -p $(TEMP_DIR)
-	v++ -c $(VPP_FLAGS) -t $(TARGET) --platform $(PLATFORM) -k blake3 --temp_dir $(TEMP_DIR)  -I'$(<D)' -o'$@' '$<'
+	v++ -c $(VPP_FLAGS) -t $(TARGET) --platform $(PLATFORM) -k blake3_accelerator --temp_dir $(TEMP_DIR)  -I'$(<D)' -o'$@' '$<'
 
-$(BUILD_DIR)/blake3.xclbin: $(TEMP_DIR)/blake3.xo
+$(BUILD_DIR)/blake3_accelerator.xclbin: $(TEMP_DIR)/blake3_accelerator.xo
 	mkdir -p $(BUILD_DIR)
 	v++ -l $(VPP_FLAGS) $(VPP_LDFLAGS) -t $(TARGET) --platform $(PLATFORM) --temp_dir $(TEMP_DIR) -o'$(LINK_OUTPUT)' $(+)
-	v++ -p $(LINK_OUTPUT) $(VPP_FLAGS) -t $(TARGET) --platform $(PLATFORM) --package.out_dir $(PACKAGE_OUT) -o $(BUILD_DIR)/blake3.xclbin
+	v++ -p $(LINK_OUTPUT) $(VPP_FLAGS) -t $(TARGET) --platform $(PLATFORM) --package.out_dir $(PACKAGE_OUT) -o $(BUILD_DIR)/blake3_accelerator.xclbin
 
 ############################## Setting Rules for Host (Building Host Executable) ##############################
 $(EXECUTABLE): $(HOST_SRCS) | check-xrt

@@ -17,6 +17,7 @@
 
 #include "cmdlineparser.h"
 #include <iostream>
+#include <vector>
 #include <cstring>
 #include <chrono>
 
@@ -30,6 +31,12 @@
 #define CHUNK_END   (1 << 1)
 #define PARENT      (1 << 2)
 #define ROOT        (1 << 3)
+
+const int NUM_CHUNKS = 256;
+const int NUM_PASSES = NUM_CHUNKS / 128;  // 2 passes
+const int BLOCKS_PER_PE = NUM_PASSES * 512; // 1024 blocks per PE
+const int TOTAL_BLOCKS = NUM_CHUNKS * 16;   // 4096 blocks total
+// 추후에 constexpr int or uint_32 등으로 block flag와 같이 통일해도 좋을 듯
 
 static const uint32_t SW_IV[8] = {
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
@@ -115,11 +122,11 @@ static inline void sw_parent_cv(const uint32_t left[8], const uint32_t right[8],
     for (int i = 0; i < 8; i++) out_cv[i] = out16[i];
 }
 
-void sw_blake3_full_tree(uint32_t input_data[512][16], uint32_t final_out[8]) {
-    uint32_t cv_stack[5][8]; // depth 5 is enough for the 32 chunks
+void sw_blake3_full_tree(uint32_t input_data[TOTAL_BLOCKS][16], uint32_t final_out[8]) {
+    uint32_t cv_stack[16][8]; // 256청크면 depth 8까지만 쓰이므로 16이면 아주 넉넉함
     int cv_stack_len = 0;
 
-    for (int c = 0; c < 32; c++) {
+    for (uint32_t c = 0; c < NUM_CHUNKS; c++) {
         uint32_t current_cv[8];
         for (int i = 0; i < 8; i++) current_cv[i] = SW_IV[i];
 
@@ -143,7 +150,8 @@ void sw_blake3_full_tree(uint32_t input_data[512][16], uint32_t final_out[8]) {
             uint32_t left_child[8];
             for (int i = 0; i < 8; i++) left_child[i] = cv_stack[cv_stack_len][i];
 
-            uint32_t flags = (total_chunks == 2 && c == 31) ? ROOT : 0;
+            // 트리의 진짜 마지막 병합 순간에만 ROOT 부여
+            uint32_t flags = ((total_chunks == 2) && (c == NUM_CHUNKS - 1)) ? ROOT : 0;
             
             sw_parent_cv(left_child, new_cv, flags, new_cv);
             
@@ -156,7 +164,6 @@ void sw_blake3_full_tree(uint32_t input_data[512][16], uint32_t final_out[8]) {
 
     for (int i = 0; i < 8; i++) final_out[i] = cv_stack[0][i];
 }
-
 
 int main(int argc, char** argv) {
     // Command Line Parser
@@ -182,31 +189,61 @@ int main(int argc, char** argv) {
     std::cout << "Load the xclbin " << binaryFile << std::endl;
     auto uuid = device.load_xclbin(binaryFile);
 
-    auto krnl = xrt::kernel(device, uuid, "blake3");
+    auto krnl = xrt::kernel(device, uuid, "blake3_accelerator");
 
     std::cout << "Allocate Buffer in Global Memory\n";
-    auto in_bo = xrt::bo(device, sizeof(uint32_t) * 512 * 16, krnl.group_id(0));
-    auto out_bo = xrt::bo(device, sizeof(uint32_t) * 8, krnl.group_id(1));
+    size_t in_size_bytes = sizeof(uint32_t) * BLOCKS_PER_PE * 16; // 4B * 16 = one block size
+    size_t out_size_bytes = sizeof(uint32_t) * 8; // 4B * 8
+
+    auto in_bo_0 = xrt::bo(device, in_size_bytes, krnl.group_id(0));
+    auto in_bo_1 = xrt::bo(device, in_size_bytes, krnl.group_id(1));
+    auto in_bo_2 = xrt::bo(device, in_size_bytes, krnl.group_id(2));
+    auto in_bo_3 = xrt::bo(device, in_size_bytes, krnl.group_id(3));
+    auto out_bo  = xrt::bo(device, out_size_bytes, krnl.group_id(4));
 
     // Map the contents of the buffer object into host memory
-    uint32_t* in_map = in_bo.map<uint32_t*>();
-    uint32_t* out_map = out_bo.map<uint32_t*>();
+    uint32_t* in_map_0 = in_bo_0.map<uint32_t*>();
+    uint32_t* in_map_1 = in_bo_1.map<uint32_t*>();
+    uint32_t* in_map_2 = in_bo_2.map<uint32_t*>();
+    uint32_t* in_map_3 = in_bo_3.map<uint32_t*>();
+    uint32_t* out_map  = out_bo.map<uint32_t*>();
 
-    uint32_t test_data[512][16];
-    for (int i = 0; i < 512; i++) {
-        for (int j = 0; j < 16; j++) {
-            uint32_t val = (i * 16 + j) * 0x11223344;
-            in_map[i * 16 + j] = val;
-            test_data[i][j] = val;
+    std::vector<std::vector<uint32_t>> sw_in(TOTAL_BLOCKS, std::vector<uint32_t>(16));
+    uint32_t sw_out[8];
+
+    printf("[Host] Generating Data with HW/SW interleaving mapping...\n");
+
+    for (uint32_t p = 0; p < NUM_PASSES; p++) {
+        for (int e = 0; e < 4; e++) {
+            for (int c = 0; c < 32; c++) {
+                uint32_t global_chunk_idx = p * 128 + e * 32 + c; 
+                
+                for (int b = 0; b < 16; b++) {
+                    uint32_t local_idx = p * 512 + c * 16 + b;
+                    
+                    for (int w = 0; w < 16; w++) {
+                        uint32_t val = (global_chunk_idx * 16 + b + w) * 0x11223344;
+                        sw_in[global_chunk_idx * 16 + b][w] = val; 
+
+                        if (e == 0) in_map_0[local_idx * 16 + w] = val;
+                        if (e == 1) in_map_1[local_idx * 16 + w] = val;
+                        if (e == 2) in_map_2[local_idx * 16 + w] = val;
+                        if (e == 3) in_map_3[local_idx * 16 + w] = val;
+                    }
+                }
+            }
         }
     }
 
     // Synchronize buffer content with device side
     std::cout << "synchronize input buffer data to device global memory\n";
-    in_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    in_bo_0.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    in_bo_1.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    in_bo_2.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    in_bo_3.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
     auto krnl_start = std::chrono::steady_clock::now();
-    auto run = krnl(in_bo, out_bo);
+    auto run = krnl(in_bo_0, in_bo_1, in_bo_2, in_bo_3, out_bo, NUM_CHUNKS);
     run.wait();
     auto krnl_end = std::chrono::steady_clock::now();
 
@@ -215,19 +252,30 @@ int main(int argc, char** argv) {
     std::chrono::duration<double> krnl_time = krnl_end - krnl_start;
     std::cout << "Kernel Exec: " << krnl_time.count() << " s" <<std::endl;
 
-    uint32_t sw_out[8];
-    sw_blake3_full_tree(test_data, sw_out);
+    std::cout << "[Host] Running Software Golden Reference...\n";
+    // Convert vector to raw array for the sw function
+    uint32_t sw_in_raw[TOTAL_BLOCKS][16];
+    for(size_t i=0; i<TOTAL_BLOCKS; ++i) {
+        std::copy(sw_in[i].begin(), sw_in[i].end(), sw_in_raw[i]);
+    }
+    sw_blake3_full_tree(sw_in_raw, sw_out);
 
     int errors = 0;
+    std::cout << "\n[Result Comparison (Root Hash)]\n";
     for (int i = 0; i < 8; i++) {
         if (out_map[i] != sw_out[i]) {
-            printf("Mismatch [%d] HW: %08X, SW: %08X\n", i, out_map[i], sw_out[i]);
+            printf("MISMATCH [%d] HW: %08X, SW: %08X\n", i, out_map[i], sw_out[i]);
             errors++;
+        } else {
+            printf("MATCH    [%d] HW: %08X, SW: %08X\n", i, out_map[i], sw_out[i]);
         }
     }
 
-    if (errors == 0) std::cout << ">>> TEST PASSED!" << std::endl;
-    else std::cout << ">>> TEST FAILED!" << std::endl;
+    if (errors == 0) {
+        std::cout << ">>> TEST PASSED! HW Output perfectly matches SW Golden Reference.\n";
+    } else {
+        std::cout << ">>> TEST FAILED! Found " << errors << " mismatches.\n";
+    }
 
     return errors;
 }
