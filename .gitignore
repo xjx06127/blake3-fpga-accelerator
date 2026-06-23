@@ -9,7 +9,7 @@ package.*/
 analyzer_input/
 
 # --- 실행 파일 및 바이너리 ---
-blake3_xrt
+*_xrt
 *.xo
 *.xclbin
 
