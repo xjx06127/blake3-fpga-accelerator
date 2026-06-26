@@ -33,3 +33,7 @@ summary.csv
 *.swp
 *.swo
 .DS_Store
+
+*wdb
+*wcfg
+*protoinst
