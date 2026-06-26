@@ -197,34 +197,45 @@ void parent_cv(const cv_vec_t& left, const cv_vec_t& right, uint32_t flags, cv_v
 }
 
 void dispatcher_pe(const block_vec_t* ext_mem, hls::stream<internal_pkt>& out_fifo, uint32_t chunk_offset_base, uint32_t num_passes) {
-    for (uint32_t p = 0; p < num_passes; p++) {
+    // FIFO에 write를 쉼 없이 할 수 있다.
+
+    block_vec_t buffer[2][BLOCKS_PER_PE];
+
+    for (uint32_t p = 0; p <= num_passes; p++) {
+        // p=0일때는 채우기만, p=num_passes일때는 직전 p에서 채운거 write하기만
         #pragma HLS LOOP_TRIPCOUNT min=1 max=2
-        
-        uint32_t chunk_offset = chunk_offset_base + p * CHUNKS_PER_PASS;
-        
-        block_vec_t local_buffer[BLOCKS_PER_PE];
+
+        uint32_t wr_idx = p % 2; // buffer에 write
+        uint32_t rd_idx = 1 - wr_idx; // buffer에서 read(FIFO에 write)
 
         for (int i = 0; i < BLOCKS_PER_PE; i++) {
             #pragma HLS PIPELINE II=1
-            local_buffer[i] = ext_mem[p * BLOCKS_PER_PE + i]; 
-        }
+            #pragma HLS dependence variable=buffer type=inter false
+            
+            // 마지막 Pass에서는 read 중단
+            if (p < num_passes) {
+                buffer[wr_idx][i] = ext_mem[p * BLOCKS_PER_PE + i];
+            }
 
-        for (int i = 0; i < BLOCKS_PER_PE; i++) {
-            #pragma HLS PIPELINE II=1
-            
-            int block_idx = i / CHUNKS_PER_ENGINE;
-            int chunk_idx = i % CHUNKS_PER_ENGINE;
-            int local_addr = (chunk_idx * BLOCKS_PER_CHUNK) + block_idx;
-            
-            internal_pkt pkt;
-            pkt.data = local_buffer[local_addr]; 
-            pkt.chunk_idx = chunk_offset + chunk_idx;
-            
-            pkt.flags = 0;
-            if (block_idx == 0)  pkt.flags |= CHUNK_START;
-            if (block_idx == 15) pkt.flags |= CHUNK_END;
-            
-            out_fifo.write(pkt);
+            // FIFO Write 및 Transpose (첫 번째 Pass에서는 write 중단)
+            if (p > 0) {
+                uint32_t prev_p = p - 1;
+                // 이전 pass의 것, 즉 미리 저장된걸 FIFO에 써줘야함
+                
+                int block_idx = i / CHUNKS_PER_ENGINE;
+                int chunk_idx = i % CHUNKS_PER_ENGINE;
+                int local_addr = (chunk_idx * BLOCKS_PER_CHUNK) + block_idx;
+                
+                internal_pkt pkt;
+                pkt.data = buffer[rd_idx][local_addr]; 
+                pkt.chunk_idx = chunk_offset_base + prev_p * CHUNKS_PER_PASS + chunk_idx;
+                
+                pkt.flags = 0;
+                if (block_idx == 0)  pkt.flags |= CHUNK_START;
+                if (block_idx == 15) pkt.flags |= CHUNK_END;
+                
+                out_fifo.write(pkt);
+            }
         }
     }
 }
