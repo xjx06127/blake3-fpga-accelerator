@@ -16,12 +16,13 @@ const int CHUNKS_PER_PASS   = NUM_ENGINES * CHUNKS_PER_ENGINE;      // 128 청�
 const int BLOCKS_PER_PE     = CHUNKS_PER_ENGINE * BLOCKS_PER_CHUNK; // 512 블록
 
 const int MAX_PASSES        = 32; // 최대 4096청크(4MB) input 지원
+const int MAX_CHUNKS        = MAX_PASSES * CHUNKS_PER_PASS; // 최대 4096청크(4MB) input 지원. 32 * 128
 const int MAX_FINAL_NODES   = MAX_PASSES * 2;
 const int MAX_FINAL_STAGES  = 6;  // 최대 64노드 트리 병합
 const int CV_PE_STAGES      = 6;  // Pass 내 트리 병합 단계 (마지막 2개 노드 남김)
 
 // ─── 프라그마 전용 스트림 및 AXI Depth 상수 ──────────────────────────────
-const int AXI_DEPTH_IN        = BLOCKS_PER_PE * 2; // 그때그때 바꾸기
+const int AXI_DEPTH_IN        = MAX_CHUNKS * BLOCKS_PER_CHUNK; // 최대 블락
 const int AXI_DEPTH_OUT       = 1;
 const int FIFO_DEPTH_D2C      = 4;
 const int FIFO_DEPTH_C2CV     = 32;

@@ -32,11 +32,7 @@
 #define PARENT      (1 << 2)
 #define ROOT        (1 << 3)
 
-const int NUM_CHUNKS = 256;
-const int NUM_PASSES = NUM_CHUNKS / 128;  // 2 passes
-const int BLOCKS_PER_PE = NUM_PASSES * 512; // 1024 blocks per PE
-const int TOTAL_BLOCKS = NUM_CHUNKS * 16;   // 4096 blocks total
-// 추후에 constexpr int or uint_32 등으로 block flag와 같이 통일해도 좋을 듯
+const int NUM_ENGINES = 4;  // 총 PE 쌍 개수(dispatcher-comp)
 
 static const uint32_t SW_IV[8] = {
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
@@ -122,11 +118,11 @@ static inline void sw_parent_cv(const uint32_t left[8], const uint32_t right[8],
     for (int i = 0; i < 8; i++) out_cv[i] = out16[i];
 }
 
-void sw_blake3_full_tree(uint32_t input_data[TOTAL_BLOCKS][16], uint32_t final_out[8]) {
+void sw_blake3_full_tree(const std::vector<std::vector<uint32_t>>& input_data, uint32_t final_out[8], uint32_t num_chunks) {
     uint32_t cv_stack[16][8]; // 256청크면 depth 8까지만 쓰이므로 16이면 아주 넉넉함
     int cv_stack_len = 0;
 
-    for (uint32_t c = 0; c < NUM_CHUNKS; c++) {
+    for (uint32_t c = 0; c < num_chunks; c++) {
         uint32_t current_cv[8];
         for (int i = 0; i < 8; i++) current_cv[i] = SW_IV[i];
 
@@ -136,7 +132,8 @@ void sw_blake3_full_tree(uint32_t input_data[TOTAL_BLOCKS][16], uint32_t final_o
             if (b == 15) flags |= CHUNK_END;
 
             uint32_t out16[16];
-            sw_compress(current_cv, input_data[c * 16 + b], c, 64, flags, out16);
+            sw_compress(current_cv, input_data[c * 16 + b].data(), c, 64, flags, out16);
+            // flatten indexing은 유지하고, .data로 넘겨야할듯?
             for (int i = 0; i < 8; i++) current_cv[i] = out16[i];
         }
         
@@ -151,7 +148,7 @@ void sw_blake3_full_tree(uint32_t input_data[TOTAL_BLOCKS][16], uint32_t final_o
             for (int i = 0; i < 8; i++) left_child[i] = cv_stack[cv_stack_len][i];
 
             // 트리의 진짜 마지막 병합 순간에만 ROOT 부여
-            uint32_t flags = ((total_chunks == 2) && (c == NUM_CHUNKS - 1)) ? ROOT : 0;
+            uint32_t flags = ((total_chunks == 2) && (c == num_chunks - 1)) ? ROOT : 0;
             
             sw_parent_cv(left_child, new_cv, flags, new_cv);
             
@@ -173,16 +170,27 @@ int main(int argc, char** argv) {
     //**************//"<Full Arg>",  "<Short Arg>", "<Description>", "<Default>"
     parser.addSwitch("--xclbin_file", "-x", "input binary file string", "");
     parser.addSwitch("--device_id", "-d", "device index", "0");
+    parser.addSwitch("--num_chunks", "-n", "number of chunks to process (multiple of 128)", std::to_string(32 * NUM_ENGINES));
     parser.parse(argc, argv);
 
     // Read settings
     std::string binaryFile = parser.value("xclbin_file");
     int device_index = stoi(parser.value("device_id"));
+    uint32_t num_chunks = stoi(parser.value("num_chunks"));
+
+    if (num_chunks % 128 != 0) {
+        std::cerr << "Error: num_chunks must be a multiple of 128." << std::endl;
+        return EXIT_FAILURE;
+    }
 
     if (argc < 3) {
         parser.printHelp();
         return EXIT_FAILURE;
     }
+
+    uint32_t num_passes = num_chunks / 128;
+    uint32_t blocks_per_pe = num_passes * 512; // 한 PE당 한 패스에 512개 블락 처리(32개 청크)
+    uint32_t total_blocks = num_chunks * 16;
 
     std::cout << "Open the device" << device_index << std::endl;
     auto device = xrt::device(device_index);
@@ -192,7 +200,7 @@ int main(int argc, char** argv) {
     auto krnl = xrt::kernel(device, uuid, "blake3_accelerator");
 
     std::cout << "Allocate Buffer in Global Memory\n";
-    size_t in_size_bytes = sizeof(uint32_t) * BLOCKS_PER_PE * 16; // 4B * 16 = one block size
+    size_t in_size_bytes = sizeof(uint32_t) * blocks_per_pe * 16; // 4B * 16 = one block size
     size_t out_size_bytes = sizeof(uint32_t) * 8; // 4B * 8
 
     auto in_bo_0 = xrt::bo(device, in_size_bytes, krnl.group_id(0));
@@ -208,12 +216,12 @@ int main(int argc, char** argv) {
     uint32_t* in_map_3 = in_bo_3.map<uint32_t*>();
     uint32_t* out_map  = out_bo.map<uint32_t*>();
 
-    std::vector<std::vector<uint32_t>> sw_in(TOTAL_BLOCKS, std::vector<uint32_t>(16));
+    std::vector<std::vector<uint32_t>> sw_in(total_blocks, std::vector<uint32_t>(16));
     uint32_t sw_out[8];
 
     printf("[Host] Generating Data with HW/SW interleaving mapping...\n");
 
-    for (uint32_t p = 0; p < NUM_PASSES; p++) {
+    for (uint32_t p = 0; p < num_passes; p++) {
         for (int e = 0; e < 4; e++) {
             for (int c = 0; c < 32; c++) {
                 uint32_t global_chunk_idx = p * 128 + e * 32 + c; 
@@ -243,7 +251,7 @@ int main(int argc, char** argv) {
     in_bo_3.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
     auto krnl_start = std::chrono::steady_clock::now();
-    auto run = krnl(in_bo_0, in_bo_1, in_bo_2, in_bo_3, out_bo, NUM_CHUNKS);
+    auto run = krnl(in_bo_0, in_bo_1, in_bo_2, in_bo_3, out_bo, num_chunks);
     run.wait();
     auto krnl_end = std::chrono::steady_clock::now();
 
@@ -253,15 +261,11 @@ int main(int argc, char** argv) {
     std::cout << "Kernel Exec: " << krnl_time.count() << " s" <<std::endl;
 
     std::cout << "[Host] Running Software Golden Reference...\n";
-    // Convert vector to raw array for the sw function
-    uint32_t sw_in_raw[TOTAL_BLOCKS][16];
-    for(size_t i=0; i<TOTAL_BLOCKS; ++i) {
-        std::copy(sw_in[i].begin(), sw_in[i].end(), sw_in_raw[i]);
-    }
-    sw_blake3_full_tree(sw_in_raw, sw_out);
+    
+    sw_blake3_full_tree(sw_in, sw_out, num_chunks);
 
     int errors = 0;
-    std::cout << "\n[Result Comparison (Root Hash)]\n";
+    std::cout << "\n[Result Comparison (Root Hash), num_chunks: " << num_chunks << "]\n";
     for (int i = 0; i < 8; i++) {
         if (out_map[i] != sw_out[i]) {
             printf("MISMATCH [%d] HW: %08X, SW: %08X\n", i, out_map[i], sw_out[i]);

@@ -52,7 +52,7 @@ LINK_OUTPUT := $(BUILD_DIR)/blake3_accelerator.link.xclbin
 PACKAGE_OUT = ./package.$(TARGET)
 
 VPP_PFLAGS := 
-CMD_ARGS = -x $(BUILD_DIR)/blake3_accelerator.xclbin
+CMD_ARGS = -x $(BUILD_DIR)/blake3_accelerator.xclbin -n $(NUM_CHUNKS)
 CXXFLAGS += -I$(XILINX_XRT)/include -I$(XILINX_VIVADO)/include -Wall -O0 -g -std=c++17
 LDFLAGS += -L$(XILINX_XRT)/lib -pthread -lOpenCL
 
