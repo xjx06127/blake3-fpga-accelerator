@@ -119,7 +119,7 @@ static inline void sw_parent_cv(const uint32_t left[8], const uint32_t right[8],
 }
 
 void sw_blake3_full_tree(const std::vector<std::vector<uint32_t>>& input_data, uint32_t final_out[8], uint32_t num_chunks) {
-    uint32_t cv_stack[16][8]; // 256청크면 depth 8까지만 쓰이므로 16이면 아주 넉넉함
+    uint32_t cv_stack[16][8]; // 256청크면 depth 8까지만 쓰이므로 16이면 아주 넉넉함. cv_stack[현재 스택에 있는 CV][그 CV의 one word(4B)]
     int cv_stack_len = 0;
 
     for (uint32_t c = 0; c < num_chunks; c++) {
@@ -147,8 +147,11 @@ void sw_blake3_full_tree(const std::vector<std::vector<uint32_t>>& input_data, u
             uint32_t left_child[8];
             for (int i = 0; i < 8; i++) left_child[i] = cv_stack[cv_stack_len][i];
 
-            // 트리의 진짜 마지막 병합 순간에만 ROOT 부여
-            uint32_t flags = ((total_chunks == 2) && (c == num_chunks - 1)) ? ROOT : 0;
+            // 트리의 진짜 마지막 병합 순간에만 ROOT 부여. 마지막 청크고, cv_stack가 비어있을때.
+            uint32_t flags = 0;
+            if ((c == num_chunks - 1) && (cv_stack_len == 0)) {
+                flags = ROOT;
+            }
             
             sw_parent_cv(left_child, new_cv, flags, new_cv);
             
@@ -156,6 +159,28 @@ void sw_blake3_full_tree(const std::vector<std::vector<uint32_t>>& input_data, u
         }
         
         for (int i = 0; i < 8; i++) cv_stack[cv_stack_len][i] = new_cv[i];
+        cv_stack_len++;
+    }
+
+    // Finalize 과정 (공식 C 구현체의 blake3_hasher_finalize 역할)
+    // 청크 개수가 128처럼 2의 거듭제곱이면 while문 스킵 (이미 스택 길이가 1이므로).
+    // 청크 개수가 384처럼 2의 거듭제곱이 아니면, 스택에 남은 서브트리들을 병합
+    while (cv_stack_len > 1) {
+        cv_stack_len--;
+        uint32_t right_child[8];
+        for (int i = 0; i < 8; i++) right_child[i] = cv_stack[cv_stack_len][i];
+
+        cv_stack_len--;
+        uint32_t left_child[8];
+        for (int i = 0; i < 8; i++) left_child[i] = cv_stack[cv_stack_len][i];
+
+        // 마지막 두 서브트리 병합 시 ROOT 부여
+        uint32_t flags = (cv_stack_len == 0) ? ROOT : 0;
+        
+        uint32_t merged_cv[8];
+        sw_parent_cv(left_child, right_child, flags, merged_cv);
+        
+        for (int i = 0; i < 8; i++) cv_stack[cv_stack_len][i] = merged_cv[i];
         cv_stack_len++;
     }
 
@@ -169,7 +194,7 @@ int main(int argc, char** argv) {
     // Switches
     //**************//"<Full Arg>",  "<Short Arg>", "<Description>", "<Default>"
     parser.addSwitch("--xclbin_file", "-x", "input binary file string", "");
-    parser.addSwitch("--device_id", "-d", "device index", "0");
+    parser.addSwitch("--device_id", "-d", "device index", "1");
     parser.addSwitch("--num_chunks", "-n", "number of chunks to process (multiple of 128)", std::to_string(32 * NUM_ENGINES));
     parser.parse(argc, argv);
 
@@ -244,21 +269,33 @@ int main(int argc, char** argv) {
     }
 
     // Synchronize buffer content with device side
-    std::cout << "synchronize input buffer data to device global memory\n";
+    std::cout << "\n[Host -> Device] Transferring data to HBM...\n";
+    auto h2d_start = std::chrono::steady_clock::now();
     in_bo_0.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     in_bo_1.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     in_bo_2.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     in_bo_3.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    auto h2d_end = std::chrono::steady_clock::now();
 
+    std::cout << "[Kernel] Running BLAKE3 Accelerator...\n";
     auto krnl_start = std::chrono::steady_clock::now();
     auto run = krnl(in_bo_0, in_bo_1, in_bo_2, in_bo_3, out_bo, num_chunks);
     run.wait();
     auto krnl_end = std::chrono::steady_clock::now();
 
+    std::cout << "[Device -> Host] Retrieving Hash Output...\n\n";
+    auto d2h_start = std::chrono::steady_clock::now();
     out_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    auto d2h_end = std::chrono::steady_clock::now();
 
+    std::chrono::duration<double> h2d_time = h2d_end - h2d_start;
     std::chrono::duration<double> krnl_time = krnl_end - krnl_start;
+    std::chrono::duration<double> d2h_time = d2h_end - d2h_start;
+    std::cout << "H2D Transfer Time: " << h2d_time.count() << " s"<<std::endl;
     std::cout << "Kernel Exec: " << krnl_time.count() << " s" <<std::endl;
+    std::cout << "D2H Transfer Time: " << d2h_time.count() << " s" <<std::endl;
+
+    std::cout<<std::endl;
 
     std::cout << "[Host] Running Software Golden Reference...\n";
     
@@ -275,11 +312,26 @@ int main(int argc, char** argv) {
         }
     }
 
+    std::cout<<std::endl;
+
     if (errors == 0) {
         std::cout << ">>> TEST PASSED! HW Output perfectly matches SW Golden Reference.\n";
     } else {
         std::cout << ">>> TEST FAILED! Found " << errors << " mismatches.\n";
     }
+
+    double port_data_gb = (double)in_size_bytes / 1e9; // GB 단위 변환 (10^9)
+    double total_data_gb = port_data_gb * 4; // 4개의 포트 사용
+
+    double effective_bw_per_port = port_data_gb / krnl_time.count(); // GB/s
+    double total_effective_bw = total_data_gb / krnl_time.count();   // GB/s
+
+    std::cout << "\n================ [ Performance Report ] ================\n";
+    std::cout << "Data Size per Port : " << port_data_gb * 1000 << " MB\n";
+    std::cout << "Total Data Size    : " << total_data_gb * 1000 << " MB\n";
+    std::cout << "Effective BW (Port): " << effective_bw_per_port << " GB/s\n";
+    std::cout << "Effective BW (Total): " << total_effective_bw << " GB/s\n";
+    std::cout << "========================================================\n\n";
 
     return errors;
 }
