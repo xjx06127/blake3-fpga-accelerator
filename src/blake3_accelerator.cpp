@@ -15,26 +15,30 @@ const int BLOCKS_PER_CHUNK  = 16; // 청크 당 블락 수
 const int CHUNKS_PER_PASS   = NUM_ENGINES * CHUNKS_PER_ENGINE;      // 128 청크
 const int BLOCKS_PER_PE     = CHUNKS_PER_ENGINE * BLOCKS_PER_CHUNK; // 512 블록
 
-const int MAX_PASSES        = 32; // 최대 4096청크(4MB) input 지원
+const int MAX_PASSES        = 32; // 최대 4096청크(4MB) input 지원 --> 이거 안쓰임 cv_pe_fianl 구조 바뀌어서!!
 const int MAX_CHUNKS        = MAX_PASSES * CHUNKS_PER_PASS; // 최대 4096청크(4MB) input 지원. 32 * 128
+// 추후 확장해야할듯. 공식 지원 스펙까지. 0이상, 2^64 - 1 Bytes이하 아무 바이트나...
 const int MAX_FINAL_NODES   = MAX_PASSES * 2;
 const int MAX_FINAL_STAGES  = 6;  // 최대 64노드 트리 병합
 const int CV_PE_STAGES      = 6;  // Pass 내 트리 병합 단계 (마지막 2개 노드 남김)
 
-// ─── 프라그마 전용 스트림 및 AXI Depth 상수 ──────────────────────────────
-const int AXI_DEPTH_IN        = MAX_CHUNKS * BLOCKS_PER_CHUNK; // 최대 블락
-const int AXI_DEPTH_OUT       = 1;
+// ─── FIFO depth 상수 ──────────────────────────────
 const int FIFO_DEPTH_D2C      = 4;
 const int FIFO_DEPTH_C2CV     = 32;
 const int FIFO_DEPTH_CV2FINAL = 4;
 
-typedef hls::vector<uint32_t, 16> block_vec_t;
-typedef hls::vector<uint32_t, 8>  cv_vec_t;
+typedef hls::vector<uint32_t, 16> block_vec_t; // 각 원소가 한 블락 --> 총 16개의 블락
+typedef hls::vector<uint32_t, 8>  cv_vec_t; // 벡터 전체가 한 청크
 
 struct internal_pkt {
     block_vec_t data;
     uint32_t    chunk_idx;
     uint32_t    flags;
+};
+
+struct dual_cv_pkt {
+    cv_vec_t left;
+    cv_vec_t right;
 };
 
 static const uint32_t IV[8] = {
@@ -197,6 +201,7 @@ void parent_cv(const cv_vec_t& left, const cv_vec_t& right, uint32_t flags, cv_v
     }
 }
 
+// 나중에 실제 핑퐁말고 그냥 dispatcher와 fpga 상에서 성능비교해보자
 void dispatcher_pe(const block_vec_t* ext_mem, hls::stream<internal_pkt>& out_fifo, uint32_t chunk_offset_base, uint32_t num_passes) {
     // FIFO에 write를 쉼 없이 할 수 있다.
 
@@ -213,7 +218,7 @@ void dispatcher_pe(const block_vec_t* ext_mem, hls::stream<internal_pkt>& out_fi
             #pragma HLS PIPELINE II=1
             #pragma HLS dependence variable=buffer type=inter false
             
-            // 마지막 Pass에서는 read 중단
+            // p == num_passes일 경우엔 read 중단
             if (p < num_passes) {
                 buffer[wr_idx][i] = ext_mem[p * BLOCKS_PER_PE + i];
             }
@@ -308,7 +313,7 @@ void cv_pe(hls::stream<cv_vec_t>& in_cv_fifo_0,
            hls::stream<cv_vec_t>& in_cv_fifo_1,
            hls::stream<cv_vec_t>& in_cv_fifo_2,
            hls::stream<cv_vec_t>& in_cv_fifo_3,
-           hls::stream<cv_vec_t>& out_cv_fifo,
+           hls::stream<dual_cv_pkt>& out_cv_fifo,
            uint32_t num_passes) {
     
     // 레벨별로는 후반에 가면 디펜던시 생기니까 outer loop는 파이프라이닝 하지 않는 것이 중요
@@ -332,6 +337,7 @@ void cv_pe(hls::stream<cv_vec_t>& in_cv_fifo_0,
         for (int stage = 0; stage < CV_PE_STAGES; stage++) {
             // stage 0이면 가장 트리의 맨 아래부터 시작
             // stage 5일때, 루트 노드 이전의 노드 2개 만듦 (num_pass가 1일때도 ROOT FLAG를 cv_final_pe에서 하도록)
+            // 4개 comp-disp마다 하나씩 cv_pe 있는거니까, 항상 128개 청크 단위로 merging. 따라서 항상 0~5 stages
             #pragma HLS UNROLL // 없으면 동적 변수인 merging_cnt 보수적으로 잡아서 내부 for문에서. 64로 고정되어버림. --> 사이클 폭증
             int merging_cnt = (CHUNKS_PER_PASS >> (stage + 1));
             
@@ -360,50 +366,85 @@ void cv_pe(hls::stream<cv_vec_t>& in_cv_fifo_0,
                 buf[out_row][out_col] = merged_cv;
             }
         }
-        out_cv_fifo.write(buf[0][0]);
-        out_cv_fifo.write(buf[0][1]);
+
+        // num_chunks가 128개면 cv_pe에서 그냥 root flag 붙이면 되기에 cv_pe_final 자체가 필요가 없다.
+        // 128의 배수가 된다면, root flag 안붙이고 그냥 노드 하나로 모아서 cv_pe_final로 보내면 되지 않냐? 노드 두개 쓸 필요 없이
+        // 즉, cv_pe에서 128개, 128개의 배수 둘 다 지원하려면,
+        // if 문으로 분기를 줘서 num_passes == 1인 경우는 root flag를 붙이도록하고 그게 아니면 그냥 하나로 합친뒤 넘기게 하는걸 생각할 수 있다.
+        // 근데 이러면 결국 cv_final_pe는 필요하다. 배수를 지원하는 경우를 위해.
+        // 어차피 cv_final_pe가 반드시 필요하다면 굳이 num_passes == 1인 복잡한 경우를 cv_pe 내에서 처리하지말고,
+        // 노드 두개 넘겨버리면 cv_final_pe를 써서 일관성 있게 처리 가능하다 (num_passes==1인 경우에도)
+        // --> 결론은 cv_pe_final 필요하니까 루트 관련은 저기서 처리하고 cv_pe에서는 직전까지 병합만 하자는 소리
+        // if문 분기한 것, 즉 노드 하나로(사이클수 아낄수 있을지도?) vs 그냥 두개 넘기는 것 중 뭐가 성능이 좋은지는 한번 분석해봐야할 듯
+        // 분기해도 사이클 수는 동일하고 리소스는 두배 나쁘니 후자로 가자
+
+        dual_cv_pkt out_pkt;
+        out_pkt.left = buf[0][0];
+        out_pkt.right = buf[0][1];
+        out_cv_fifo.write(out_pkt);
     }
 }
 
-void cv_pe_final(hls::stream<cv_vec_t>& in_cv_fifo, 
+void cv_pe_final(hls::stream<dual_cv_pkt>& in_cv_fifo,
                  uint32_t num_passes, 
                  cv_vec_t* ext_out) {
-                 
-    cv_vec_t buf[MAX_FINAL_NODES];
-    #pragma HLS ARRAY_PARTITION variable=buf cyclic factor=2 dim=1
 
-    // 1. 필요한 노드를 모두 모을 때까지 대기
-    int actual_nodes = num_passes * 2;
-    for (int i = 0; i < actual_nodes; i++) {
-        #pragma HLS LOOP_TRIPCOUNT min=2 max=4
-        #pragma HLS PIPELINE II=1
-        buf[i] = in_cv_fifo.read();
-    }
+    cv_vec_t cv_stack[8]; // 여유있게 잡은 것. 나중에 tight하게 맞추기
+    #pragma HLS ARRAY_PARTITION variable=cv_stack complete
+    int cv_stack_len = 0;
 
-    // 2. 일괄 병합 (고정된 트리 구조)
-    for (int stage = 0; stage < MAX_FINAL_STAGES; stage++) {
-        #pragma HLS UNROLL
-        int max_merges    = (MAX_FINAL_NODES >> (stage + 1)); 
-        int actual_merges = (actual_nodes >> (stage + 1)); 
+    for (uint32_t c = 0; c < num_passes; c++) {
+        #pragma HLS LOOP_TRIPCOUNT min=1 max=2
+        
+        dual_cv_pkt in_pkt = in_cv_fifo.read();
+        cv_vec_t new_cv;
+        
+        uint32_t pre_merge_flags = (num_passes == 1) ? ROOT : 0;
+        // num_passes가 1이면 굳이 stack에서 병합할 필요 없음
+        parent_cv(in_pkt.left, in_pkt.right, pre_merge_flags, new_cv);
 
-        for (int i = 0; i < max_merges; i++) {
-            #pragma HLS PIPELINE II=1
-            #pragma HLS dependence variable=buf type=inter false
+        uint32_t total_chunks_so_far = c + 1; 
 
-            if (i < actual_merges) {
-                // 이 병합이 트리의 마지막인지 판단하여 ROOT 플래그 적용
-                bool is_root = (actual_merges == 1) && (i == 0);
-                uint32_t flag = is_root ? ROOT : 0;
+        while ((total_chunks_so_far & 1) == 0) {
+            cv_stack_len--; 
+            cv_vec_t left_child = cv_stack[cv_stack_len];
 
-                cv_vec_t left  = buf[2 * i];
-                cv_vec_t right = buf[2 * i + 1];
-                cv_vec_t merged_cv;
-                parent_cv(left, right, flag, merged_cv);
-                buf[i] = merged_cv;
-            }
+            // 트리의 진짜 마지막 병합 순간에만 ROOT 부여
+            uint32_t flags = 0;
+            if ((c == num_passes - 1) && (cv_stack_len == 0)) {
+                flags = ROOT;
+            }            
+
+            cv_vec_t merged_cv;
+            parent_cv(left_child, new_cv, flags, merged_cv);
+            new_cv = merged_cv;
+            
+            total_chunks_so_far >>= 1;
         }
+        
+        cv_stack[cv_stack_len] = new_cv;
+        cv_stack_len++;
     }
-    ext_out[0] = buf[0];
+
+    // Finalize: 스택에 남아있는 서브트리들 일괄 병합
+    while (cv_stack_len > 1) {
+        cv_stack_len--;
+        cv_vec_t right_child = cv_stack[cv_stack_len];
+
+        cv_stack_len--;
+        cv_vec_t left_child = cv_stack[cv_stack_len];
+
+        // 마지막 두 서브트리 병합 시 ROOT 부여
+        uint32_t flags = (cv_stack_len == 0) ? ROOT : 0;
+        
+        cv_vec_t merged_cv;
+        parent_cv(left_child, right_child, flags, merged_cv);
+        
+        cv_stack[cv_stack_len] = merged_cv;
+        cv_stack_len++;
+    }
+
+    ext_out[0] = cv_stack[0];
 }
 
 void blake3_accelerator(const block_vec_t* host_data_in_0,
@@ -412,11 +453,11 @@ void blake3_accelerator(const block_vec_t* host_data_in_0,
             const block_vec_t* host_data_in_3,
             cv_vec_t* host_hash_out,
             uint32_t  num_chunks) {
-    #pragma HLS INTERFACE m_axi port=host_data_in_0 depth=AXI_DEPTH_IN bundle=gmem0
-    #pragma HLS INTERFACE m_axi port=host_data_in_1 depth=AXI_DEPTH_IN bundle=gmem1
-    #pragma HLS INTERFACE m_axi port=host_data_in_2 depth=AXI_DEPTH_IN bundle=gmem2
-    #pragma HLS INTERFACE m_axi port=host_data_in_3 depth=AXI_DEPTH_IN bundle=gmem3
-    #pragma HLS INTERFACE m_axi port=host_hash_out  depth=AXI_DEPTH_OUT   bundle=gmem4
+    #pragma HLS INTERFACE m_axi port=host_data_in_0 bundle=gmem0
+    #pragma HLS INTERFACE m_axi port=host_data_in_1 bundle=gmem1
+    #pragma HLS INTERFACE m_axi port=host_data_in_2 bundle=gmem2
+    #pragma HLS INTERFACE m_axi port=host_data_in_3 bundle=gmem3
+    #pragma HLS INTERFACE m_axi port=host_hash_out bundle=gmem4
 
     uint32_t num_passes = num_chunks / CHUNKS_PER_PASS;
 
@@ -440,11 +481,11 @@ void blake3_accelerator(const block_vec_t* host_data_in_0,
     #pragma HLS STREAM variable=comp_to_cv_2 depth=FIFO_DEPTH_C2CV
     #pragma HLS STREAM variable=comp_to_cv_3 depth=FIFO_DEPTH_C2CV
 
-    hls::stream<cv_vec_t> cv_pe_to_cv_final("cv_pe_to_cv_final");
+    hls::stream<dual_cv_pkt> cv_pe_to_cv_final("cv_pe_to_cv_final");
     #pragma HLS STREAM variable=cv_pe_to_cv_final depth=FIFO_DEPTH_CV2FINAL
 
     #pragma HLS DATAFLOW
-    dispatcher_pe(host_data_in_0, disp_to_comp_0, 0 * CHUNKS_PER_ENGINE,  num_passes);
+    dispatcher_pe(host_data_in_0, disp_to_comp_0, 0 * CHUNKS_PER_ENGINE, num_passes);
     dispatcher_pe(host_data_in_1, disp_to_comp_1, 1 * CHUNKS_PER_ENGINE, num_passes);
     dispatcher_pe(host_data_in_2, disp_to_comp_2, 2 * CHUNKS_PER_ENGINE, num_passes);
     dispatcher_pe(host_data_in_3, disp_to_comp_3, 3 * CHUNKS_PER_ENGINE, num_passes);
