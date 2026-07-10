@@ -393,7 +393,6 @@ void cv_pe_final(hls::stream<cv_vec_t>& in_cv_fifo,
                  cv_vec_t* ext_out) {
 
     cv_vec_t cv_stack[8]; // 여유있게 잡은 것. 나중에 tight하게 맞추기
-    #pragma HLS ARRAY_PARTITION variable=cv_stack complete
     int cv_stack_len = 0;
 
     for (uint32_t c = 0; c < num_passes; c++) {
