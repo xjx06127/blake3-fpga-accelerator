@@ -15,13 +15,13 @@ const int BLOCKS_PER_CHUNK  = 16; // 청크 당 블락 수
 const int CHUNKS_PER_PASS   = NUM_ENGINES * CHUNKS_PER_ENGINE;      // 128 청크
 const int BLOCKS_PER_PE     = CHUNKS_PER_ENGINE * BLOCKS_PER_CHUNK; // 512 블록
 
-const int MAX_PASSES        = 32; // 최대 4096청크(4MB) input 지원 --> 이거 안쓰임 cv_pe_fianl 구조 바뀌어서!!
-const int MAX_CHUNKS        = MAX_PASSES * CHUNKS_PER_PASS; // 최대 4096청크(4MB) input 지원. 32 * 128
-// 추후 확장해야할듯. 공식 지원 스펙까지. 0이상, 2^64 - 1 Bytes이하 아무 바이트나...
-const int MAX_FINAL_NODES   = MAX_PASSES * 2;
-const int MAX_FINAL_STAGES  = 6;  // 최대 64노드 트리 병합
+// const int MAX_PASSES        = 32; // 최대 4096청크(4MB) input 지원 --> 이거 안쓰임 cv_pe_fianl 구조 바뀌어서!!
+// const int MAX_CHUNKS        = MAX_PASSES * CHUNKS_PER_PASS; // 최대 4096청크(4MB) input 지원. 32 * 128
+// // 추후 확장해야할듯. 공식 지원 스펙까지. 0이상, 2^64 - 1 Bytes이하 아무 바이트나...
+// const int MAX_FINAL_NODES   = MAX_PASSES * 2;
+// const int MAX_FINAL_STAGES  = 6;  // 최대 64노드 트리 병합
 const int CV_PE_STAGES      = 6;  // Pass 내 트리 병합 단계 (마지막 2개 노드 남김)
-
+const int CV_FINAL_STACK_DEPTH = 16; // 1GB 정도의 input 지원 가능
 // ─── FIFO depth 상수 ──────────────────────────────
 const int FIFO_DEPTH_D2C      = 4;
 const int FIFO_DEPTH_C2CV     = 32;
@@ -32,7 +32,7 @@ typedef hls::vector<uint32_t, 8>  cv_vec_t; // 벡터 전체가 한 청크
 
 struct internal_pkt {
     block_vec_t data;
-    uint32_t    chunk_idx;
+    uint64_t    chunk_idx;
     uint32_t    flags;
 };
 
@@ -197,14 +197,14 @@ void parent_cv(const cv_vec_t& left, const cv_vec_t& right, uint32_t flags, cv_v
 }
 
 // 나중에 실제 핑퐁말고 그냥 dispatcher와 fpga 상에서 성능비교해보자
-void dispatcher_pe(const block_vec_t* ext_mem, hls::stream<internal_pkt>& out_fifo, uint32_t chunk_offset_base, uint32_t num_passes) {
+void dispatcher_pe(const block_vec_t* ext_mem, hls::stream<internal_pkt>& out_fifo, uint64_t chunk_offset_base, uint64_t num_passes) {
     // FIFO에 write를 쉼 없이 할 수 있다.
 
     block_vec_t buffer[2][BLOCKS_PER_PE];
 
-    for (uint32_t p = 0; p <= num_passes; p++) {
+    for (uint64_t p = 0; p <= num_passes; p++) {
         // p=0일때는 채우기만, p=num_passes일때는 직전 p에서 채운거 write하기만
-        #pragma HLS LOOP_TRIPCOUNT min=1 max=2
+        #pragma HLS LOOP_TRIPCOUNT min=2 max=3
 
         uint32_t wr_idx = p % 2; // buffer에 write
         uint32_t rd_idx = 1 - wr_idx; // buffer에서 read(FIFO에 write)
@@ -220,7 +220,7 @@ void dispatcher_pe(const block_vec_t* ext_mem, hls::stream<internal_pkt>& out_fi
 
             // FIFO Write 및 Transpose (첫 번째 Pass에서는 write 중단)
             if (p > 0) {
-                uint32_t prev_p = p - 1;
+                uint64_t prev_p = p - 1;
                 // 이전 pass의 것, 즉 미리 저장된걸 FIFO에 써줘야함
                 
                 int block_idx = i / CHUNKS_PER_ENGINE;
@@ -228,7 +228,12 @@ void dispatcher_pe(const block_vec_t* ext_mem, hls::stream<internal_pkt>& out_fi
                 int local_addr = (chunk_idx * BLOCKS_PER_CHUNK) + block_idx;
                 
                 internal_pkt pkt;
-                pkt.data = buffer[rd_idx][local_addr]; 
+                if(rd_idx==0){
+                    pkt.data = buffer[0][local_addr];
+                }
+                else{
+                    pkt.data = buffer[1][local_addr];
+                }
                 pkt.chunk_idx = chunk_offset_base + prev_p * CHUNKS_PER_PASS + chunk_idx;
                 
                 pkt.flags = 0;
@@ -241,7 +246,7 @@ void dispatcher_pe(const block_vec_t* ext_mem, hls::stream<internal_pkt>& out_fi
     }
 }
 
-void comp_pe(hls::stream<internal_pkt>& in_fifo, hls::stream<cv_vec_t>& out_cv_fifo, uint32_t num_passes) {
+void comp_pe(hls::stream<internal_pkt>& in_fifo, hls::stream<cv_vec_t>& out_cv_fifo, uint64_t num_passes) {
     // latency = 32*16+31 = 543
     // interval = 512 --> 512개 루프 끝나면 바로 다음꺼 먹을 수 있음. 32개 청크 무한 섭취 가능
     // 0 사이클에서 처음 comp_pe에 input으로 블락 들어간다할때, 511 사이클에서 처음 FIFO에 write
@@ -251,7 +256,7 @@ void comp_pe(hls::stream<internal_pkt>& in_fifo, hls::stream<cv_vec_t>& out_cv_f
     // array for temporary cv
 
 
-    for (uint32_t p = 0; p < num_passes; p++) {
+    for (uint64_t p = 0; p < num_passes; p++) {
         #pragma HLS LOOP_TRIPCOUNT min=1 max=2
         for (int i = 0; i < BLOCKS_PER_PE; i++) {
             #pragma HLS PIPELINE II=1
@@ -309,9 +314,9 @@ void cv_pe(hls::stream<cv_vec_t>& in_cv_fifo_0,
            hls::stream<cv_vec_t>& in_cv_fifo_2,
            hls::stream<cv_vec_t>& in_cv_fifo_3,
            hls::stream<cv_vec_t>& out_cv_fifo,
-           uint32_t num_passes) {
+           uint64_t num_passes) {
 
-    for (uint32_t p = 0; p < num_passes; p++) {
+    for (uint64_t p = 0; p < num_passes; p++) {
         #pragma HLS LOOP_TRIPCOUNT min=1 max=2
 
         cv_vec_t buf_A[CHUNKS_PER_PASS];      // 128
@@ -389,13 +394,13 @@ void cv_pe(hls::stream<cv_vec_t>& in_cv_fifo_0,
 }
 
 void cv_pe_final(hls::stream<cv_vec_t>& in_cv_fifo, 
-                 uint32_t num_passes, 
+                 uint64_t num_passes, 
                  cv_vec_t* ext_out) {
 
-    cv_vec_t cv_stack[8]; // 여유있게 잡은 것. 나중에 tight하게 맞추기
+    cv_vec_t cv_stack[CV_FINAL_STACK_DEPTH];
     int cv_stack_len = 0;
 
-    for (uint32_t c = 0; c < num_passes; c++) {
+    for (uint64_t c = 0; c < num_passes; c++) {
         #pragma HLS LOOP_TRIPCOUNT min=1 max=2
         
         cv_vec_t left_cv = in_cv_fifo.read();
@@ -406,7 +411,7 @@ void cv_pe_final(hls::stream<cv_vec_t>& in_cv_fifo,
         // num_passes가 1이면 굳이 stack에서 병합할 필요 없음
         parent_cv(left_cv, right_cv, pre_merge_flags, new_cv);
 
-        uint32_t total_chunks_so_far = c + 1; 
+        uint64_t total_chunks_so_far = c + 1; 
 
         while ((total_chunks_so_far & 1) == 0) {
             cv_stack_len--; 
@@ -455,14 +460,14 @@ void blake3_accelerator(const block_vec_t* host_data_in_0,
             const block_vec_t* host_data_in_2,
             const block_vec_t* host_data_in_3,
             cv_vec_t* host_hash_out,
-            uint32_t  num_chunks) {
+            uint64_t  num_chunks) {
     #pragma HLS INTERFACE m_axi port=host_data_in_0 bundle=gmem0
     #pragma HLS INTERFACE m_axi port=host_data_in_1 bundle=gmem1
     #pragma HLS INTERFACE m_axi port=host_data_in_2 bundle=gmem2
     #pragma HLS INTERFACE m_axi port=host_data_in_3 bundle=gmem3
     #pragma HLS INTERFACE m_axi port=host_hash_out bundle=gmem4
 
-    uint32_t num_passes = num_chunks / CHUNKS_PER_PASS;
+    uint64_t num_passes = num_chunks / CHUNKS_PER_PASS;
 
     hls::stream<internal_pkt> disp_to_comp_0("disp_to_comp_0");
     hls::stream<internal_pkt> disp_to_comp_1("disp_to_comp_1");

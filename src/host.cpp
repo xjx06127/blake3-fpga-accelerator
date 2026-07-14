@@ -118,11 +118,11 @@ static inline void sw_parent_cv(const uint32_t left[8], const uint32_t right[8],
     for (int i = 0; i < 8; i++) out_cv[i] = out16[i];
 }
 
-void sw_blake3_full_tree(const std::vector<std::vector<uint32_t>>& input_data, uint32_t final_out[8], uint32_t num_chunks) {
-    uint32_t cv_stack[16][8]; // 256청크면 depth 8까지만 쓰이므로 16이면 아주 넉넉함. cv_stack[현재 스택에 있는 CV][그 CV의 one word(4B)]
+void sw_blake3_full_tree(const std::vector<std::vector<uint32_t>>& input_data, uint32_t final_out[8], uint64_t num_chunks) {
+    uint32_t cv_stack[24][8]; // cv_stack[현재 스택에 있는 CV--> one chunk][그 CV의 one word(4B)]
     int cv_stack_len = 0;
 
-    for (uint32_t c = 0; c < num_chunks; c++) {
+    for (uint64_t c = 0; c < num_chunks; c++) {
         uint32_t current_cv[8];
         for (int i = 0; i < 8; i++) current_cv[i] = SW_IV[i];
 
@@ -201,7 +201,7 @@ int main(int argc, char** argv) {
     // Read settings
     std::string binaryFile = parser.value("xclbin_file");
     int device_index = stoi(parser.value("device_id"));
-    uint32_t num_chunks = stoi(parser.value("num_chunks"));
+    uint64_t num_chunks = stoull(parser.value("num_chunks"));
 
     if (num_chunks % 128 != 0) {
         std::cerr << "Error: num_chunks must be a multiple of 128." << std::endl;
@@ -213,9 +213,9 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    uint32_t num_passes = num_chunks / 128;
-    uint32_t blocks_per_pe = num_passes * 512; // 한 PE당 한 패스에 512개 블락 처리(32개 청크)
-    uint32_t total_blocks = num_chunks * 16;
+    uint64_t num_passes = num_chunks / 128;
+    uint64_t blocks_per_pe = num_passes * 512; // 한 PE당 한 패스에 512개 블락 처리(32개 청크)
+    uint64_t total_blocks = num_chunks * 16;
 
     std::cout << "Open the device" << device_index << std::endl;
     auto device = xrt::device(device_index);
@@ -246,10 +246,10 @@ int main(int argc, char** argv) {
 
     printf("[Host] Generating Data with HW/SW interleaving mapping...\n");
 
-    for (uint32_t p = 0; p < num_passes; p++) {
+    for (uint64_t p = 0; p < num_passes; p++) {
         for (int e = 0; e < 4; e++) {
             for (int c = 0; c < 32; c++) {
-                uint32_t global_chunk_idx = p * 128 + e * 32 + c; 
+                uint64_t global_chunk_idx = p * 128 + e * 32 + c; 
                 
                 for (int b = 0; b < 16; b++) {
                     uint32_t local_idx = p * 512 + c * 16 + b;
