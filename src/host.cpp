@@ -118,8 +118,12 @@ static inline void sw_parent_cv(const uint32_t left[8], const uint32_t right[8],
     for (int i = 0; i < 8; i++) out_cv[i] = out16[i];
 }
 
-void sw_blake3_full_tree(const std::vector<std::vector<uint32_t>>& input_data, uint32_t final_out[8], uint64_t num_chunks) {
+void sw_blake3_full_tree(const std::vector<uint32_t>& input_data,
+                        uint32_t final_out[8],
+                        uint64_t num_chunks) {
+
     uint32_t cv_stack[24][8]; // cv_stack[현재 스택에 있는 CV--> one chunk][그 CV의 one word(4B)]
+    // 여기에 저장되는건 한 청크에 대한 CV임. 여러 청크를 묶은 CV가 아니라 --> kernel stack과 저장되는 단위 다름
     int cv_stack_len = 0;
 
     for (uint64_t c = 0; c < num_chunks; c++) {
@@ -132,8 +136,7 @@ void sw_blake3_full_tree(const std::vector<std::vector<uint32_t>>& input_data, u
             if (b == 15) flags |= CHUNK_END;
 
             uint32_t out16[16];
-            sw_compress(current_cv, input_data[c * 16 + b].data(), c, 64, flags, out16);
-            // flatten indexing은 유지하고, .data로 넘겨야할듯?
+            sw_compress(current_cv, input_data.data() + ((c * 16 + b) * 16), c, 64, flags, out16);
             for (int i = 0; i < 8; i++) current_cv[i] = out16[i];
         }
         
@@ -225,7 +228,8 @@ int main(int argc, char** argv) {
     auto krnl = xrt::kernel(device, uuid, "blake3_accelerator");
 
     std::cout << "Allocate Buffer in Global Memory\n";
-    size_t in_size_bytes = sizeof(uint32_t) * blocks_per_pe * 16; // 4B * 16 = one block size
+    size_t in_size_bytes = sizeof(uint32_t) * 16 * blocks_per_pe; // 4B * 16 = one block size
+    // 이것도 uint64_t로 캐스팅 됨
     size_t out_size_bytes = sizeof(uint32_t) * 8; // 4B * 8
 
     auto in_bo_0 = xrt::bo(device, in_size_bytes, krnl.group_id(0));
@@ -241,7 +245,7 @@ int main(int argc, char** argv) {
     uint32_t* in_map_3 = in_bo_3.map<uint32_t*>();
     uint32_t* out_map  = out_bo.map<uint32_t*>();
 
-    std::vector<std::vector<uint32_t>> sw_in(total_blocks, std::vector<uint32_t>(16));
+    std::vector<uint32_t> sw_in(total_blocks * 16); //한 블락이 16*4B(64B). 그걸 total_blocks만큼 만들어라
     uint32_t sw_out[8];
 
     printf("[Host] Generating Data with HW/SW interleaving mapping...\n");
@@ -252,11 +256,11 @@ int main(int argc, char** argv) {
                 uint64_t global_chunk_idx = p * 128 + e * 32 + c; 
                 
                 for (int b = 0; b < 16; b++) {
-                    uint32_t local_idx = p * 512 + c * 16 + b;
+                    uint64_t local_idx = p * 512 + c * 16 + b;
                     
                     for (int w = 0; w < 16; w++) {
-                        uint32_t val = (global_chunk_idx * 16 + b + w) * 0x11223344;
-                        sw_in[global_chunk_idx * 16 + b][w] = val; 
+                        uint64_t val = (global_chunk_idx * 16 + b + w) * 0x11223344;
+                        sw_in[(global_chunk_idx * 16 + b) * 16 + w] = val; // 1차원 평탄화 인덱싱
 
                         if (e == 0) in_map_0[local_idx * 16 + w] = val;
                         if (e == 1) in_map_1[local_idx * 16 + w] = val;
