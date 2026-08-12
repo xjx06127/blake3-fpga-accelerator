@@ -27,8 +27,8 @@ const int FIFO_DEPTH_D2C      = 4;
 const int FIFO_DEPTH_C2CV     = 32;
 const int FIFO_DEPTH_CV2FINAL = 4;
 
-typedef hls::vector<uint32_t, 16> block_vec_t; // 각 원소가 한 블락 --> 총 16개의 블락
-typedef hls::vector<uint32_t, 8>  cv_vec_t; // 벡터 전체가 한 청크
+typedef hls::vector<uint32_t, 16> block_vec_t; // 각 원소가 한 워드 -> 한 개의 block
+typedef hls::vector<uint32_t, 8>  cv_vec_t; // 벡터 전체가 한 CV
 
 struct internal_pkt {
     block_vec_t data;
@@ -321,27 +321,24 @@ void cv_pe(hls::stream<cv_vec_t>& in_cv_fifo_0,
 
         cv_vec_t buf_A[CHUNKS_PER_PASS];      // 128
         cv_vec_t buf_B[CHUNKS_PER_PASS / 2];  // 64
-        // BRAM의 포트가 2개인데, 압축하다보면 write와 read 2개 동시에 하는 경우가 있기에 포트 부족 해소를 위해 이렇게 쪼갬
+        // BRAM의 포트가 2개인데, 압축하다보면 write와 read 2개 동시에 하는 경우가 있기에 이렇게 쪼갬
 
-        for (int i = 0; i < CHUNKS_PER_ENGINE; i++) {
+        for (int i = 0; i < CHUNKS_PER_PASS; i++) {
             #pragma HLS PIPELINE II=1
-            buf_A[i] = in_cv_fifo_0.read();
-        }
-        for (int i = 0; i < CHUNKS_PER_ENGINE; i++) {
-            #pragma HLS PIPELINE II=1
-            buf_A[CHUNKS_PER_ENGINE + i] = in_cv_fifo_1.read();
-        }
-        for (int i = 0; i < CHUNKS_PER_ENGINE; i++) {
-            #pragma HLS PIPELINE II=1
-            buf_A[2 * CHUNKS_PER_ENGINE + i] = in_cv_fifo_2.read();
-        }
-        for (int i = 0; i < CHUNKS_PER_ENGINE; i++) {
-            #pragma HLS PIPELINE II=1
-            buf_A[3 * CHUNKS_PER_ENGINE + i] = in_cv_fifo_3.read();
+            
+            if (i < CHUNKS_PER_ENGINE) {
+                buf_A[i] = in_cv_fifo_0.read();
+            } else if (i < 2 * CHUNKS_PER_ENGINE) {
+                buf_A[i] = in_cv_fifo_1.read();
+            } else if (i < 3 * CHUNKS_PER_ENGINE) {
+                buf_A[i] = in_cv_fifo_2.read();
+            } else {
+                buf_A[i] = in_cv_fifo_3.read();
+            }
         }
 
         // ── Stage 0 (128 -> 64): A read, B write ──
-        for (int i = 0; i < 64; i++) {
+        for (int i = 0; i < CHUNKS_PER_PASS / 2; i++) {
             #pragma HLS PIPELINE II=1
             cv_vec_t merged;
             parent_cv(buf_A[2*i], buf_A[2*i+1], 0, merged);
@@ -349,7 +346,7 @@ void cv_pe(hls::stream<cv_vec_t>& in_cv_fifo_0,
         }
 
         // ── Stage 1 (64 -> 32): B read, A write ──
-        for (int i = 0; i < 32; i++) {
+        for (int i = 0; i < CHUNKS_PER_PASS / 4; i++) {
             #pragma HLS PIPELINE II=1
             cv_vec_t merged;
             parent_cv(buf_B[2*i], buf_B[2*i+1], 0, merged);
@@ -357,7 +354,7 @@ void cv_pe(hls::stream<cv_vec_t>& in_cv_fifo_0,
         }
 
         // ── Stage 2 (32 -> 16): A read, B write ──
-        for (int i = 0; i < 16; i++) {
+        for (int i = 0; i < CHUNKS_PER_PASS / 8; i++) {
             #pragma HLS PIPELINE II=1
             cv_vec_t merged;
             parent_cv(buf_A[2*i], buf_A[2*i+1], 0, merged);
@@ -365,7 +362,7 @@ void cv_pe(hls::stream<cv_vec_t>& in_cv_fifo_0,
         }
 
         // ── Stage 3 (16 -> 8): B read, A write ──
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < CHUNKS_PER_PASS / 16; i++) {
             #pragma HLS PIPELINE II=1
             cv_vec_t merged;
             parent_cv(buf_B[2*i], buf_B[2*i+1], 0, merged);
@@ -373,7 +370,7 @@ void cv_pe(hls::stream<cv_vec_t>& in_cv_fifo_0,
         }
 
         // ── Stage 4 (8 -> 4): A read, B write ──
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < CHUNKS_PER_PASS / 32; i++) {
             #pragma HLS PIPELINE II=1
             cv_vec_t merged;
             parent_cv(buf_A[2*i], buf_A[2*i+1], 0, merged);
@@ -381,7 +378,7 @@ void cv_pe(hls::stream<cv_vec_t>& in_cv_fifo_0,
         }
 
         // ── Stage 5 (4 -> 2): B read, A write ── 최종 결과가 buf_A[0], buf_A[1]에 담김
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < CHUNKS_PER_PASS / 64; i++) {
             #pragma HLS PIPELINE II=1
             cv_vec_t merged;
             parent_cv(buf_B[2*i], buf_B[2*i+1], 0, merged);
@@ -396,6 +393,7 @@ void cv_pe(hls::stream<cv_vec_t>& in_cv_fifo_0,
 void cv_pe_final(hls::stream<cv_vec_t>& in_cv_fifo, 
                  uint64_t num_passes, 
                  cv_vec_t* ext_out) {
+    // cv_final_pe로 이름 바꾸자!
 
     cv_vec_t cv_stack[CV_FINAL_STACK_DEPTH];
     int cv_stack_len = 0;
