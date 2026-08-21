@@ -15,24 +15,22 @@ const int BLOCKS_PER_CHUNK  = 16; // 청크 당 블락 수
 const int CHUNKS_PER_PASS   = NUM_ENGINES * CHUNKS_PER_ENGINE;      // 128 청크
 const int BLOCKS_PER_PE     = CHUNKS_PER_ENGINE * BLOCKS_PER_CHUNK; // 512 블록
 
-// const int MAX_PASSES        = 32; // 최대 4096청크(4MB) input 지원 --> 이거 안쓰임 cv_pe_fianl 구조 바뀌어서!!
-// const int MAX_CHUNKS        = MAX_PASSES * CHUNKS_PER_PASS; // 최대 4096청크(4MB) input 지원. 32 * 128
-// // 추후 확장해야할듯. 공식 지원 스펙까지. 0이상, 2^64 - 1 Bytes이하 아무 바이트나...
-// const int MAX_FINAL_NODES   = MAX_PASSES * 2;
-// const int MAX_FINAL_STAGES  = 6;  // 최대 64노드 트리 병합
-const int CV_PE_STAGES      = 6;  // Pass 내 트리 병합 단계 (마지막 2개 노드 남김)
-const int CV_FINAL_STACK_DEPTH = 16; // 1GB 정도의 input 지원 가능
+const int CV_PE_STAGES      = 7;
 // ─── FIFO depth 상수 ──────────────────────────────
 const int FIFO_DEPTH_D2C      = 4;
 const int FIFO_DEPTH_C2CV     = 32;
-const int FIFO_DEPTH_CV2FINAL = 4;
+
+const int FIFO_DEPTH_CV2FINAL = 32;
+// 기존엔 pass당 2개만 흘렀지만, configurable ver.는 S이 작을수록 pass당 128/M개가
+//        한꺼번에 쏟아진다 (S=4면 32개). 얕으면 cv_pe가 stall → BW 손실.
+// cv2final에서 나중에 혹시 512 cycle안에 처리 못하면 FIFO 터질수도
 
 typedef hls::vector<uint32_t, 16> block_vec_t; // 각 원소가 한 워드 -> 한 개의 block
 typedef hls::vector<uint32_t, 8>  cv_vec_t; // 벡터 전체가 한 CV
 
 struct internal_pkt {
     block_vec_t data;
-    uint64_t    chunk_idx;
+    uint64_t    chunk_idx; // 전역 청크 번호
     uint32_t    flags;
 };
 
