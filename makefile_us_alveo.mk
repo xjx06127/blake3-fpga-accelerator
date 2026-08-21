@@ -51,8 +51,12 @@ BUILD_DIR := ./build_dir.$(TARGET).$(XSA)
 LINK_OUTPUT := $(BUILD_DIR)/blake3_accelerator.link.xclbin
 PACKAGE_OUT = ./package.$(TARGET)
 
+NUM_CHUNKS ?= 256
+CHUNKS_PER_SEGMENT ?= 4
+#default values
+
 VPP_PFLAGS := 
-CMD_ARGS = -x $(BUILD_DIR)/blake3_accelerator.xclbin -n $(NUM_CHUNKS)
+CMD_ARGS = -x $(BUILD_DIR)/blake3_accelerator.xclbin -n $(NUM_CHUNKS) -s $(CHUNKS_PER_SEGMENT)
 CXXFLAGS += -I$(XILINX_XRT)/include -I$(XILINX_VIVADO)/include -Wall -O0 -g -std=c++17
 LDFLAGS += -L$(XILINX_XRT)/lib -pthread -lOpenCL
 

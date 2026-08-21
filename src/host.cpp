@@ -118,15 +118,15 @@ static inline void sw_parent_cv(const uint32_t left[8], const uint32_t right[8],
     for (int i = 0; i < 8; i++) out_cv[i] = out16[i];
 }
 
-void sw_blake3_full_tree(const std::vector<uint32_t>& input_data,
-                        uint32_t final_out[8],
-                        uint64_t num_chunks) {
+void sw_blake3_segment(const std::vector<uint32_t>& input_data,
+                       uint64_t chunk_base,        // 이 세그먼트가 시작하는 전역 청크 번호
+                       uint64_t chunks_in_segment, // 이 세그먼트의 청크 수 (= S)
+                       uint32_t final_out[8]) {
 
-    uint32_t cv_stack[24][8]; // cv_stack[현재 스택에 있는 CV--> one chunk][그 CV의 one word(4B)]
-    // 여기에 저장되는건 한 청크에 대한 CV임. 여러 청크를 묶은 CV가 아니라 --> kernel stack과 저장되는 단위 다름
+    uint32_t cv_stack[24][8];
     int cv_stack_len = 0;
 
-    for (uint64_t c = 0; c < num_chunks; c++) {
+    for (uint64_t c = 0; c < chunks_in_segment; c++) {
         uint32_t current_cv[8];
         for (int i = 0; i < 8; i++) current_cv[i] = SW_IV[i];
 
@@ -136,38 +136,37 @@ void sw_blake3_full_tree(const std::vector<uint32_t>& input_data,
             if (b == 15) flags |= CHUNK_END;
 
             uint32_t out16[16];
-            sw_compress(current_cv, input_data.data() + ((c * 16 + b) * 16), c, 64, flags, out16);
+            // ① 데이터는 전역 위치에서, ② counter는 세그먼트 내 인덱스 c 로
+            sw_compress(current_cv, input_data.data() + (((chunk_base + c) * 16 + b) * 16), c, 64, flags, out16);
             for (int i = 0; i < 8; i++) current_cv[i] = out16[i];
         }
-        
+
         uint32_t new_cv[8];
         for (int i = 0; i < 8; i++) new_cv[i] = current_cv[i];
 
-        uint64_t total_chunks = c + 1; 
+        uint64_t total_chunks = c + 1;
 
         while ((total_chunks & 1) == 0) {
-            cv_stack_len--; 
+            cv_stack_len--;
             uint32_t left_child[8];
             for (int i = 0; i < 8; i++) left_child[i] = cv_stack[cv_stack_len][i];
 
-            // 트리의 진짜 마지막 병합 순간에만 ROOT 부여. 마지막 청크고, cv_stack가 비어있을때.
+            // 이 세그먼트 트리의 진짜 마지막 병합에만 ROOT
             uint32_t flags = 0;
-            if ((c == num_chunks - 1) && (cv_stack_len == 0)) {
+            if ((c == chunks_in_segment - 1) && (cv_stack_len == 0)) {
                 flags = ROOT;
             }
-            
             sw_parent_cv(left_child, new_cv, flags, new_cv);
-            
+
             total_chunks >>= 1;
         }
-        
+
         for (int i = 0; i < 8; i++) cv_stack[cv_stack_len][i] = new_cv[i];
         cv_stack_len++;
     }
 
-    // Finalize 과정 (공식 C 구현체의 blake3_hasher_finalize 역할)
-    // 청크 개수가 128처럼 2의 거듭제곱이면 while문 스킵 (이미 스택 길이가 1이므로).
-    // 청크 개수가 384처럼 2의 거듭제곱이 아니면, 스택에 남은 서브트리들을 병합
+    // Finalize: S가 2의 거듭제곱이면 스택 길이가 이미 1이라 이 루프는 안 돈다.
+    // (비-2거듭제곱 S를 나중에 지원할 때를 위해 남겨둠)
     while (cv_stack_len > 1) {
         cv_stack_len--;
         uint32_t right_child[8];
@@ -179,10 +178,10 @@ void sw_blake3_full_tree(const std::vector<uint32_t>& input_data,
 
         // 마지막 두 서브트리 병합 시 ROOT 부여
         uint32_t flags = (cv_stack_len == 0) ? ROOT : 0;
-        
+
         uint32_t merged_cv[8];
         sw_parent_cv(left_child, right_child, flags, merged_cv);
-        
+
         for (int i = 0; i < 8; i++) cv_stack[cv_stack_len][i] = merged_cv[i];
         cv_stack_len++;
     }
@@ -199,15 +198,25 @@ int main(int argc, char** argv) {
     parser.addSwitch("--xclbin_file", "-x", "input binary file string", "");
     parser.addSwitch("--device_id", "-d", "device index", "1");
     parser.addSwitch("--num_chunks", "-n", "number of chunks to process (multiple of 128)", std::to_string(32 * NUM_ENGINES));
+    parser.addSwitch("--chunks_per_segment", "-s", "chunks per segment (power of two, 4 <= S <= 128)", "4");
     parser.parse(argc, argv);
 
     // Read settings
     std::string binaryFile = parser.value("xclbin_file");
     int device_index = stoi(parser.value("device_id"));
     uint64_t num_chunks = stoull(parser.value("num_chunks"));
+    uint32_t chunks_per_segment = (uint32_t)stoul(parser.value("chunks_per_segment"));
 
+    // num_chunks는 128의 배수
     if (num_chunks % 128 != 0) {
         std::cerr << "Error: num_chunks must be a multiple of 128." << std::endl;
+        return EXIT_FAILURE;
+    }
+
+    // chunks_per_segment는 2의 배수면서 4이상 128이하여야함.
+    if ((chunks_per_segment & (chunks_per_segment - 1)) != 0 ||
+        chunks_per_segment < 4 || chunks_per_segment > 128) {
+        std::cerr << "Error: chunks_per_segment must be a power of two with 4 <= S <= 128." << std::endl;
         return EXIT_FAILURE;
     }
 
@@ -219,6 +228,7 @@ int main(int argc, char** argv) {
     uint64_t num_passes = num_chunks / 128;
     uint64_t blocks_per_pe = num_passes * 512; // 한 PE당 한 패스에 512개 블락 처리(32개 청크)
     uint64_t total_blocks = num_chunks * 16;
+    uint64_t num_segments = num_chunks / chunks_per_segment; // 출력 해시 개수
 
     std::cout << "Open the device" << device_index << std::endl;
     auto device = xrt::device(device_index);
@@ -230,7 +240,7 @@ int main(int argc, char** argv) {
     std::cout << "Allocate Buffer in Global Memory\n";
     size_t in_size_bytes = sizeof(uint32_t) * 16 * blocks_per_pe; // 4B * 16 = one block size
     // 이것도 uint64_t로 캐스팅 됨
-    size_t out_size_bytes = sizeof(uint32_t) * 8; // 4B * 8
+    size_t out_size_bytes = sizeof(uint32_t) * 8 * num_segments;   // 4B * 8 = one hash
 
     auto in_bo_0 = xrt::bo(device, in_size_bytes, krnl.group_id(0));
     auto in_bo_1 = xrt::bo(device, in_size_bytes, krnl.group_id(1));
@@ -246,7 +256,7 @@ int main(int argc, char** argv) {
     uint32_t* out_map  = out_bo.map<uint32_t*>();
 
     std::vector<uint32_t> sw_in(total_blocks * 16); //한 블락이 16*4B(64B). 그걸 total_blocks만큼 만들어라
-    uint32_t sw_out[8];
+    std::vector<uint32_t> sw_out(num_segments * 8);
 
     printf("[Host] Generating Data with HW/SW interleaving mapping...\n");
 
@@ -272,6 +282,10 @@ int main(int argc, char** argv) {
         }
     }
 
+    for (uint64_t m = 0; m < num_segments; m++) {
+    sw_blake3_segment(sw_in, m * chunks_per_segment, chunks_per_segment, &sw_out[m * 8]);
+    }
+
     // Synchronize buffer content with device side
     std::cout << "\n[Host -> Device] Transferring data to HBM...\n";
     auto h2d_start = std::chrono::steady_clock::now();
@@ -283,7 +297,7 @@ int main(int argc, char** argv) {
 
     std::cout << "[Kernel] Running BLAKE3 Accelerator...\n";
     auto krnl_start = std::chrono::steady_clock::now();
-    auto run = krnl(in_bo_0, in_bo_1, in_bo_2, in_bo_3, out_bo, num_chunks);
+    auto run = krnl(in_bo_0, in_bo_1, in_bo_2, in_bo_3, out_bo, num_chunks, chunks_per_segment);
     run.wait();
     auto krnl_end = std::chrono::steady_clock::now();
 
@@ -302,17 +316,30 @@ int main(int argc, char** argv) {
     std::cout<<std::endl;
 
     std::cout << "[Host] Running Software Golden Reference...\n";
-    
-    sw_blake3_full_tree(sw_in, sw_out, num_chunks);
 
+    // 세그먼트마다 32B 해시 1개. word로 쪼개지 않고 세그먼트당 한 줄로 비교한다
     int errors = 0;
-    std::cout << "\n[Result Comparison (Root Hash), num_chunks: " << num_chunks << "]\n";
-    for (int i = 0; i < 8; i++) {
-        if (out_map[i] != sw_out[i]) {
-            printf("MISMATCH [%d] HW: %08X, SW: %08X\n", i, out_map[i], sw_out[i]);
+    std::cout << "\n[Result Comparison] num_chunks: " << num_chunks
+               << ", chunks_per_segment: " << chunks_per_segment
+               << ", num_segments: " << num_segments << "\n";
+    for (uint64_t m = 0; m < num_segments; m++) {
+        int mismatch = 0;
+        for (int i = 0; i < 8; i++) {
+            if (out_map[m * 8 + i] != sw_out[m * 8 + i]) mismatch = 1;
+        }
+
+        printf("[seg %5llu] chunk %6llu~%6llu  HW=",
+               (unsigned long long)m,
+               (unsigned long long)(m * chunks_per_segment),
+               (unsigned long long)((m + 1) * chunks_per_segment - 1));
+        for (int i = 0; i < 8; i++) printf("%08x", out_map[m * 8 + i]);
+        printf("  %s\n", mismatch ? "<<< MISMATCH" : "MATCH");
+
+        if (mismatch) {
+            printf("                          SW=");
+            for (int i = 0; i < 8; i++) printf("%08x", sw_out[m * 8 + i]);
+            printf("\n");
             errors++;
-        } else {
-            printf("MATCH    [%d] HW: %08X, SW: %08X\n", i, out_map[i], sw_out[i]);
         }
     }
 
