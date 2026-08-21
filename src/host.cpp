@@ -213,7 +213,7 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    // chunks_per_segment는 2의 배수면서 4이상 128이하여야함.
+    // chunks_per_segment는 2의 거듭제곱이면서 4이상 128이하여야함.
     if ((chunks_per_segment & (chunks_per_segment - 1)) != 0 ||
         chunks_per_segment < 4 || chunks_per_segment > 128) {
         std::cerr << "Error: chunks_per_segment must be a power of two with 4 <= S <= 128." << std::endl;
