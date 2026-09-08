@@ -51,9 +51,8 @@ BUILD_DIR := ./build_dir.$(TARGET).$(XSA)
 LINK_OUTPUT := $(BUILD_DIR)/blake3_accelerator.link.xclbin
 PACKAGE_OUT = ./package.$(TARGET)
 
-NUM_CHUNKS ?= 256
-CHUNKS_PER_SEGMENT ?= 4
-#default values
+NUM_CHUNKS ?= 1048576
+CHUNKS_PER_SEGMENT ?= 128
 
 VPP_PFLAGS := 
 CMD_ARGS = -x $(BUILD_DIR)/blake3_accelerator.xclbin -n $(NUM_CHUNKS) -s $(CHUNKS_PER_SEGMENT)
@@ -79,7 +78,18 @@ VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_data_in_0:HBM[0]
 VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_data_in_1:HBM[1]
 VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_data_in_2:HBM[2]
 VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_data_in_3:HBM[3]
-VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_hash_out:HBM[4]
+VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_data_in_4:HBM[4]
+VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_data_in_5:HBM[5]
+VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_data_in_6:HBM[6]
+VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_data_in_7:HBM[7]
+VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_hash_out:HBM[8]
+
+############################## Implementation Strategy ##############################
+# --kernel_frequency 써도 오류땜에 안먹는듯
+# VPP_LDFLAGS += --kernel_frequency 250
+# VPP_LDFLAGS += --vivado.prop run.impl_1.STEPS.PLACE_DESIGN.TCL.PRE=$(CURDIR)/spread.tcl
+# VPP_LDFLAGS += --vivado.prop run.impl_1.STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE=AlternateCLBRouting
+VPP_LDFLAGS += --vivado.prop run.impl_1.STEPS.OPT_DESIGN.TCL.PRE=$(CURDIR)/clk_target.tcl
 
 EXECUTABLE = ./blake3_accelerator_xrt
 EMCONFIG_DIR = $(TEMP_DIR)

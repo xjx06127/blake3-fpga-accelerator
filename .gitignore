@@ -37,3 +37,16 @@ summary.csv
 *wdb
 *wcfg
 *protoinst
+
+CLAUDE.md
+
+*.tcl
+*.bak
+
+tmp
+
+*.keep
+
+*.jou
+
+*.ORIG

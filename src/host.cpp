@@ -32,7 +32,9 @@
 #define PARENT      (1 << 2)
 #define ROOT        (1 << 3)
 
-const int NUM_ENGINES = 4;  // 총 PE 쌍 개수(dispatcher-comp)
+const int NUM_ENGINES = 8;  // 총 PE 쌍 개수(dispatcher-comp)
+const int CHUNKS_PER_ENGINE = 32;                          // 엔진당 한 pass에 처리하는 청크 수
+const int CHUNKS_PER_PASS = NUM_ENGINES * CHUNKS_PER_ENGINE; // 1 pass = 256 청크
 
 static const uint32_t SW_IV[8] = {
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
@@ -197,8 +199,8 @@ int main(int argc, char** argv) {
     //**************//"<Full Arg>",  "<Short Arg>", "<Description>", "<Default>"
     parser.addSwitch("--xclbin_file", "-x", "input binary file string", "");
     parser.addSwitch("--device_id", "-d", "device index", "1");
-    parser.addSwitch("--num_chunks", "-n", "number of chunks to process (multiple of 128)", std::to_string(32 * NUM_ENGINES));
-    parser.addSwitch("--chunks_per_segment", "-s", "chunks per segment (power of two, 4 <= S <= 128)", "4");
+    parser.addSwitch("--num_chunks", "-n", "number of chunks to process (multiple of 256, and of NUM_ENGINES*S)", std::to_string(2 * CHUNKS_PER_PASS));
+    parser.addSwitch("--chunks_per_segment", "-s", "chunks per segment (power of two, 4 <= S <= 1024)", "4");
     parser.parse(argc, argv);
 
     // Read settings
@@ -207,16 +209,24 @@ int main(int argc, char** argv) {
     uint64_t num_chunks = stoull(parser.value("num_chunks"));
     uint32_t chunks_per_segment = (uint32_t)stoul(parser.value("chunks_per_segment"));
 
-    // num_chunks는 128의 배수
-    if (num_chunks % 128 != 0) {
-        std::cerr << "Error: num_chunks must be a multiple of 128." << std::endl;
+    // num_chunks는 CHUNKS_PER_PASS(=NUM_ENGINES*32=256)의 배수 (구조적 요구사항)
+    if (num_chunks % CHUNKS_PER_PASS != 0) {
+        std::cerr << "Error: num_chunks must be a multiple of " << CHUNKS_PER_PASS << "." << std::endl;
         return EXIT_FAILURE;
     }
 
-    // chunks_per_segment는 2의 거듭제곱이면서 4이상 128이하여야함.
+    // chunks_per_segment는 2의 거듭제곱이면서 4 <= S <= 1024
     if ((chunks_per_segment & (chunks_per_segment - 1)) != 0 ||
-        chunks_per_segment < 4 || chunks_per_segment > 128) {
-        std::cerr << "Error: chunks_per_segment must be a power of two with 4 <= S <= 128." << std::endl;
+        chunks_per_segment < 4 || chunks_per_segment > 1024) {
+        std::cerr << "Error: chunks_per_segment must be a power of two with 4 <= S <= 1024." << std::endl;
+        return EXIT_FAILURE;
+    }
+
+    // block 배치 제약: 엔진 e의 담당 구간 base = e*(N/NUM_ENGINES)가 S의 배수여야
+    //   comp_pe의 counter 마스킹(chunk_idx & (S-1))이 그대로 성립한다.
+    if (num_chunks % ((uint64_t)NUM_ENGINES * chunks_per_segment) != 0) {
+        std::cerr << "Error: num_chunks must be a multiple of NUM_ENGINES*chunks_per_segment ("
+                  << (uint64_t)NUM_ENGINES * chunks_per_segment << ")." << std::endl;
         return EXIT_FAILURE;
     }
 
@@ -225,7 +235,7 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    uint64_t num_passes = num_chunks / 128;
+    uint64_t num_passes = num_chunks / CHUNKS_PER_PASS;
     uint64_t blocks_per_pe = num_passes * 512; // 한 PE당 한 패스에 512개 블락 처리(32개 청크)
     uint64_t total_blocks = num_chunks * 16;
     uint64_t num_segments = num_chunks / chunks_per_segment; // 출력 해시 개수
@@ -242,17 +252,26 @@ int main(int argc, char** argv) {
     // 이것도 uint64_t로 캐스팅 됨
     size_t out_size_bytes = sizeof(uint32_t) * 8 * num_segments;   // 4B * 8 = one hash
 
+    // 커널 인자 인덱스: host_data_in_0..7 = 0..7, host_hash_out = 8
     auto in_bo_0 = xrt::bo(device, in_size_bytes, krnl.group_id(0));
     auto in_bo_1 = xrt::bo(device, in_size_bytes, krnl.group_id(1));
     auto in_bo_2 = xrt::bo(device, in_size_bytes, krnl.group_id(2));
     auto in_bo_3 = xrt::bo(device, in_size_bytes, krnl.group_id(3));
-    auto out_bo  = xrt::bo(device, out_size_bytes, krnl.group_id(4));
+    auto in_bo_4 = xrt::bo(device, in_size_bytes, krnl.group_id(4));
+    auto in_bo_5 = xrt::bo(device, in_size_bytes, krnl.group_id(5));
+    auto in_bo_6 = xrt::bo(device, in_size_bytes, krnl.group_id(6));
+    auto in_bo_7 = xrt::bo(device, in_size_bytes, krnl.group_id(7));
+    auto out_bo  = xrt::bo(device, out_size_bytes, krnl.group_id(8));
 
     // Map the contents of the buffer object into host memory
     uint32_t* in_map_0 = in_bo_0.map<uint32_t*>();
     uint32_t* in_map_1 = in_bo_1.map<uint32_t*>();
     uint32_t* in_map_2 = in_bo_2.map<uint32_t*>();
     uint32_t* in_map_3 = in_bo_3.map<uint32_t*>();
+    uint32_t* in_map_4 = in_bo_4.map<uint32_t*>();
+    uint32_t* in_map_5 = in_bo_5.map<uint32_t*>();
+    uint32_t* in_map_6 = in_bo_6.map<uint32_t*>();
+    uint32_t* in_map_7 = in_bo_7.map<uint32_t*>();
     uint32_t* out_map  = out_bo.map<uint32_t*>();
 
     std::vector<uint32_t> sw_in(total_blocks * 16); //한 블락이 16*4B(64B). 그걸 total_blocks만큼 만들어라
@@ -260,14 +279,17 @@ int main(int argc, char** argv) {
 
     printf("[Host] Generating Data with HW/SW interleaving mapping...\n");
 
+    // [v3 block] global_chunk_idx = e*(N/NUM_ENGINES) + p*32 + c
+    //   in_map_0 = chunk 0 ~ N/8-1 통째로, in_map_1 = chunk N/8 ~ N/4-1 통째로, ...
+    //   엔진끼리 완전히 독립이라 cv_pe가 엔진별 32노드 트리 8개로 돌 수 있다.
     for (uint64_t p = 0; p < num_passes; p++) {
-        for (int e = 0; e < 4; e++) {
+        for (int e = 0; e < NUM_ENGINES; e++) {
             for (int c = 0; c < 32; c++) {
-                uint64_t global_chunk_idx = p * 128 + e * 32 + c; 
-                
+                uint64_t global_chunk_idx = (uint64_t)e * (num_chunks / NUM_ENGINES) + p * 32 + c;
+
                 for (int b = 0; b < 16; b++) {
                     uint64_t local_idx = p * 512 + c * 16 + b;
-                    
+
                     for (int w = 0; w < 16; w++) {
                         uint64_t val = (global_chunk_idx * 16 + b + w) * 0x11223344;
                         sw_in[(global_chunk_idx * 16 + b) * 16 + w] = val; // 1차원 평탄화 인덱싱
@@ -276,6 +298,10 @@ int main(int argc, char** argv) {
                         if (e == 1) in_map_1[local_idx * 16 + w] = val;
                         if (e == 2) in_map_2[local_idx * 16 + w] = val;
                         if (e == 3) in_map_3[local_idx * 16 + w] = val;
+                        if (e == 4) in_map_4[local_idx * 16 + w] = val;
+                        if (e == 5) in_map_5[local_idx * 16 + w] = val;
+                        if (e == 6) in_map_6[local_idx * 16 + w] = val;
+                        if (e == 7) in_map_7[local_idx * 16 + w] = val;
                     }
                 }
             }
@@ -293,11 +319,17 @@ int main(int argc, char** argv) {
     in_bo_1.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     in_bo_2.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     in_bo_3.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    in_bo_4.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    in_bo_5.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    in_bo_6.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    in_bo_7.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     auto h2d_end = std::chrono::steady_clock::now();
 
     std::cout << "[Kernel] Running BLAKE3 Accelerator...\n";
     auto krnl_start = std::chrono::steady_clock::now();
-    auto run = krnl(in_bo_0, in_bo_1, in_bo_2, in_bo_3, out_bo, num_chunks, chunks_per_segment);
+    auto run = krnl(in_bo_0, in_bo_1, in_bo_2, in_bo_3,
+                    in_bo_4, in_bo_5, in_bo_6, in_bo_7,
+                    out_bo, num_chunks, chunks_per_segment);
     run.wait();
     auto krnl_end = std::chrono::steady_clock::now();
 
@@ -352,7 +384,7 @@ int main(int argc, char** argv) {
     }
 
     double port_data_gb = (double)in_size_bytes / 1e9; // GB 단위 변환 (10^9)
-    double total_data_gb = port_data_gb * 4; // 4개의 포트 사용
+    double total_data_gb = port_data_gb * NUM_ENGINES; // NUM_ENGINES개의 입력 포트 사용
 
     double effective_bw_per_port = port_data_gb / krnl_time.count(); // GB/s
     double total_effective_bw = total_data_gb / krnl_time.count();   // GB/s
