@@ -33,8 +33,8 @@
 #define ROOT        (1 << 3)
 
 const int NUM_ENGINES = 8;  // 총 PE 쌍 개수(dispatcher-comp)
-const int CHUNKS_PER_ENGINE = 32;                          // 엔진당 한 pass에 처리하는 청크 수
-const int CHUNKS_PER_PASS = NUM_ENGINES * CHUNKS_PER_ENGINE; // 1 pass = 256 청크
+const int CHUNKS_PER_ENGINE_PER_PASS = 32;                          // 엔진당 한 pass에 처리하는 청크 수
+const int CHUNKS_PER_PASS = NUM_ENGINES * CHUNKS_PER_ENGINE_PER_PASS; // 1 pass = 256 청크
 
 static const uint32_t SW_IV[8] = {
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
@@ -198,7 +198,7 @@ int main(int argc, char** argv) {
     // Switches
     //**************//"<Full Arg>",  "<Short Arg>", "<Description>", "<Default>"
     parser.addSwitch("--xclbin_file", "-x", "input binary file string", "");
-    parser.addSwitch("--device_id", "-d", "device index", "1");
+    parser.addSwitch("--device_id", "-d", "device index", "0");
     parser.addSwitch("--num_chunks", "-n", "number of chunks to process (multiple of 256, and of NUM_ENGINES*S)", std::to_string(2 * CHUNKS_PER_PASS));
     parser.addSwitch("--chunks_per_segment", "-s", "chunks per segment (power of two, 4 <= S <= 1024)", "4");
     parser.parse(argc, argv);
@@ -223,7 +223,8 @@ int main(int argc, char** argv) {
     }
 
     // block 배치 제약: 엔진 e의 담당 구간 base = e*(N/NUM_ENGINES)가 S의 배수여야
-    //   comp_pe의 counter 마스킹(chunk_idx & (S-1))이 그대로 성립한다.
+    //   세그먼트가 엔진 경계에서 쪼개지지 않고,
+    //   comp_pe의 counter 마스킹(engine_local_chunk_idx & (S-1))이 세그먼트 안 번호가 된다.
     if (num_chunks % ((uint64_t)NUM_ENGINES * chunks_per_segment) != 0) {
         std::cerr << "Error: num_chunks must be a multiple of NUM_ENGINES*chunks_per_segment ("
                   << (uint64_t)NUM_ENGINES * chunks_per_segment << ")." << std::endl;
@@ -277,7 +278,7 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> sw_in(total_blocks * 16); //한 블락이 16*4B(64B). 그걸 total_blocks만큼 만들어라
     std::vector<uint32_t> sw_out(num_segments * 8);
 
-    printf("[Host] Generating Data with HW/SW interleaving mapping...\n");
+    printf("[Host] Generating Data...\n");
 
     // [v3 block] global_chunk_idx = e*(N/NUM_ENGINES) + p*32 + c
     //   in_map_0 = chunk 0 ~ N/8-1 통째로, in_map_1 = chunk N/8 ~ N/4-1 통째로, ...

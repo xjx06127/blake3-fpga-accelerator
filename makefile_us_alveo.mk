@@ -83,13 +83,21 @@ VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_data_in_5:HBM[5]
 VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_data_in_6:HBM[6]
 VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_data_in_7:HBM[7]
 VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_hash_out:HBM[8]
+VPP_LDFLAGS += --connectivity.slr blake3_accelerator_1:SLR1
 
 ############################## Implementation Strategy ##############################
-# --kernel_frequency 써도 오류땜에 안먹는듯
+# --kernel_frequency 써도 오류땜에 안먹는듯 (tmp/run_102p8MHz_.../NOTE.md 참조)
 # VPP_LDFLAGS += --kernel_frequency 250
+
+# 커널 클럭: 플랫폼 기본값 300MHz 를 그대로 쓴다.
+#   clk_target.tcl 로 목표를 낮추면 배치기가 "간신히 목표 만족"에 수렴해서
+#   달성치도 같이 낮아진다 (200 제약->203.5, 250 제약->253.2, 275 제약->260.8).
+#   300 을 노리려면 300 으로 제약해야 한다.
+# VPP_LDFLAGS += --vivado.prop run.impl_1.STEPS.OPT_DESIGN.TCL.PRE=$(CURDIR)/clk_target.tcl
+
+# 엔진 8개를 3/2/3 으로 SLR 에 흩고, 각 엔진의 짝 FIFO 를 같이 데려간다.
 # VPP_LDFLAGS += --vivado.prop run.impl_1.STEPS.PLACE_DESIGN.TCL.PRE=$(CURDIR)/spread.tcl
 # VPP_LDFLAGS += --vivado.prop run.impl_1.STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE=AlternateCLBRouting
-VPP_LDFLAGS += --vivado.prop run.impl_1.STEPS.OPT_DESIGN.TCL.PRE=$(CURDIR)/clk_target.tcl
 
 EXECUTABLE = ./blake3_accelerator_xrt
 EMCONFIG_DIR = $(TEMP_DIR)

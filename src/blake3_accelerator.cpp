@@ -8,31 +8,34 @@
 #define ROOT (1 << 3)
 
 // ─── HW 아키텍처 및 파이프라인 상수 ──────────────────────────────────────
-const int NUM_ENGINES       = 8;  // 총 PE 쌍 개수(dispatcher-comp) 
-const int CHUNKS_PER_ENGINE = 32; // 엔진당 한 pass에 처리하는 청크 수
-const int BLOCKS_PER_CHUNK  = 16; // 청크 당 블락 수 
+const int NUM_ENGINES                = 8;  // 총 PE 쌍 개수(dispatcher-comp) 
+const int CHUNKS_PER_ENGINE_PER_PASS = 32; // 엔진당 한 pass에 처리하는 청크 수
+const int BLOCKS_PER_CHUNK           = 16; // 청크 당 블락 수 
 
-const int CHUNKS_PER_PASS   = NUM_ENGINES * CHUNKS_PER_ENGINE;      // 256 청크
-const int BLOCKS_PER_PE     = CHUNKS_PER_ENGINE * BLOCKS_PER_CHUNK; // 512 블록
+const int CHUNKS_PER_PASS            = NUM_ENGINES * CHUNKS_PER_ENGINE_PER_PASS;      // 256 청크
+const int BLOCKS_PER_PE              = CHUNKS_PER_ENGINE_PER_PASS * BLOCKS_PER_CHUNK; // 512 블록
 
-// S > 32 일 때 pass간에 쌓아둘 32청크 서브트리 루트의 최대 개수.
-// S <= CHUNKS_PER_ENGINE * MAX_SUB = 32 * 32 = 1024 청크(1MiB) 까지 지원.
-const int MAX_SUB = 32;
+// ─── relay 트리 상수 ──────────────────────────────
+// comp_pe가 pass당 내보내는 cv_pair 개수
+const int PAIRS_PER_ENGINE_PER_PASS = CHUNKS_PER_ENGINE_PER_PASS / 2;         // 16
+
+// 4:1 relay가 pass당 중계하는 개수.
+const int PAIRS_PER_RELAY4_PER_PASS = 4 * PAIRS_PER_ENGINE_PER_PASS; // 64
+
 // ─── FIFO depth 상수 ──────────────────────────────
-const int FIFO_DEPTH_D2C      = 4;
-const int FIFO_DEPTH_C2CV     = 16;
-
-// const int FIFO_DEPTH_CV2FINAL = 32;
-// // 기존엔 pass당 2개만 흘렀지만, configurable ver.는 S이 작을수록 pass당 128/M개가
-// //        한꺼번에 쏟아진다 (S=4면 32개). 얕으면 cv_pe가 stall → BW 손실.
-// // cv2final에서 나중에 혹시 512 cycle안에 처리 못하면 FIFO 터질수도
+const int FIFO_DEPTH_D2C  = 4;   // disp_to_comp_0..7    : dispatcher_pe -> comp_pe
+const int FIFO_DEPTH_C2R  = 16;  // comp_to_relay_0..7   : comp_pe       -> relay_4to1
+const int FIFO_DEPTH_R2R  = 16;  // relay_a4/b4_to_r2    : relay_4to1    -> relay_2to1
+const int FIFO_DEPTH_R2CV = 16;  // relay_r2_to_cv       : relay_2to1    -> cv_pe
+// relay4의 두 번째 것이 relay2에 write할 때 16에서 막히지만 상관없다. relay 간 FIFO라서.
+// 결국 cv_pe가 read stall 안 걸리고, comp_pe가 write stall 안 걸리기만 하면 된다. relay는 노상관.
 
 typedef hls::vector<uint32_t, 16> block_vec_t; // 각 원소가 한 워드 -> 한 개의 block
 typedef hls::vector<uint32_t, 8>  cv_vec_t; // 벡터 전체가 한 CV
 
 struct internal_pkt {
     block_vec_t data;
-    uint64_t    chunk_idx; // 전역 청크 번호
+    uint64_t    engine_local_chunk_idx; // 엔진 안 청크 번호
     uint32_t    flags;
 };
 
@@ -176,7 +179,7 @@ inline static void compress(const uint32_t chaining_value[8],
 
 void parent_cv(const cv_vec_t& left, const cv_vec_t& right, uint32_t flags, cv_vec_t& out_cv) {
     #pragma HLS INLINE OFF //for resource saving. not allowed to copy too many compress.
-    /// 이거 없으면 parent_cv가 unroll때 복제되어버려서 사이클 10개 아끼려서 리소스 몇배 낭비
+    /// 이거 없으면 parent_cv가 unroll때 복제되어버려서 사이클 10개 아끼려다 리소스 몇배 낭비
 
     uint32_t block_words[16];
     #pragma HLS ARRAY_PARTITION variable=block_words complete
@@ -201,9 +204,7 @@ void parent_cv(const cv_vec_t& left, const cv_vec_t& right, uint32_t flags, cv_v
     }
 }
 
-// 나중에 실제 핑퐁말고 그냥 dispatcher와 fpga 상에서 성능비교해보자
-void dispatcher_pe(const block_vec_t* ext_mem, hls::stream<internal_pkt>& out_fifo, uint64_t chunk_offset_base, uint64_t num_passes) {
-    // FIFO에 write를 쉼 없이 할 수 있다.
+void dispatcher_pe(const block_vec_t* ext_mem, hls::stream<internal_pkt>& out_fifo, uint64_t num_passes) {
 
     block_vec_t buffer[2][BLOCKS_PER_PE];
 
@@ -227,9 +228,9 @@ void dispatcher_pe(const block_vec_t* ext_mem, hls::stream<internal_pkt>& out_fi
                 uint64_t prev_p = p - 1;
                 // 이전 pass의 것, 즉 미리 저장된걸 FIFO에 써줘야함
                 
-                int block_idx = i / CHUNKS_PER_ENGINE;
-                int chunk_idx = i % CHUNKS_PER_ENGINE;
-                int local_addr = (chunk_idx * BLOCKS_PER_CHUNK) + block_idx;
+                int block_idx            = i / CHUNKS_PER_ENGINE_PER_PASS;
+                int pass_local_chunk_idx = i % CHUNKS_PER_ENGINE_PER_PASS;
+                int local_addr = (pass_local_chunk_idx * BLOCKS_PER_CHUNK) + block_idx;
                 
                 internal_pkt pkt;
                 if(rd_idx==0){
@@ -240,12 +241,8 @@ void dispatcher_pe(const block_vec_t* ext_mem, hls::stream<internal_pkt>& out_fi
                 }
                 // read만 분기하는 것이 자원소모량, negative slack 측면에서 제일 우수
 
-                // pkt.chunk_idx = chunk_offset_base + prev_p * CHUNKS_PER_PASS + chunk_idx;
-                // // 전역 청크 번호를 그대로 실어보낸다.
-                // // 세그먼트 내 counter로의 변환(마스킹)은 comp_pe에서 수행.
-
-                // block 파티셔닝을 위해 엔진이 맡은 청크단위로 건너뛰기
-                pkt.chunk_idx = chunk_offset_base + prev_p * CHUNKS_PER_ENGINE + chunk_idx;
+                // 엔진 안 청크 번호. 세그먼트 안 counter 로의 변환(마스킹)은 comp_pe 에서 한다
+                pkt.engine_local_chunk_idx = prev_p * CHUNKS_PER_ENGINE_PER_PASS + pass_local_chunk_idx;
                 
                 pkt.flags = 0;
                 if (block_idx == 0)  pkt.flags |= CHUNK_START;
@@ -258,14 +255,14 @@ void dispatcher_pe(const block_vec_t* ext_mem, hls::stream<internal_pkt>& out_fi
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-//  comp_pe  [변경점 : counter 마스킹 한 줄]
+//  comp_pe : 블록을 압축해 청크 CV 쌍을 내보낸다
 //
 //  BLAKE3는 세그먼트가 바뀌면 chunk counter가 0부터 다시 시작해야 한다.
-//    전역 청크번호:  0 1 2 3 | 4 5 6 7 | 8 9 10 11 ...
+//    엔진 안 청크번호: 0 1 2 3 | 4 5 6 7 | 8 9 10 11 ...
 //    S=4일 때 counter: 0 1 2 3 | 0 1 2 3 | 0 1  2  3 ...   ← 리셋
 //  S가 2의 거듭제곱이므로 마스크 한 번이면 끝
 //
-//  주의: cv_mem 슬롯 주소(local_chunk_idx)는 전역 청크번호 % 32 그대로 써야 한다.
+//  주의: cv_mem 슬롯 주소(pass_local_chunk_idx)는 엔진 안 청크번호 % 32 그대로 써야 한다.
 //        세그먼트 counter와 혼동하지 말 것.
 // ══════════════════════════════════════════════════════════════════════════ 
 void comp_pe(hls::stream<internal_pkt>& in_fifo, hls::stream<cv_pair_t>& out_cv_fifo,  
@@ -273,14 +270,14 @@ void comp_pe(hls::stream<internal_pkt>& in_fifo, hls::stream<cv_pair_t>& out_cv_
     // latency = 32*16+31 = 543
     // interval = 512 --> 512개 루프 끝나면 바로 다음꺼 먹을 수 있음. 32개 청크 무한 섭취 가능
     // 0 사이클에서 처음 comp_pe에 input으로 블락 들어간다할때, 511 사이클에서 처음 FIFO에 write
-    // 32개 청크 무한 섭취 가능하지만, 첫 32개 청크 다 넣고, 두번째 청크 들어간 후 511 사이클지나도
+    // 32개 청크 무한 섭취 가능하지만, 첫 32개 청크 다 넣고, 두번째 32개 청크 들어간 후 511 사이클지나도
     // cv_pe에서 압축이 안되면 문제가 된다 --> FIFO를 충분히 깊게 or cv_pe가 무조건 511 사이클보다 적도록
-    cv_vec_t cv_mem[CHUNKS_PER_ENGINE];
+    cv_vec_t cv_mem[CHUNKS_PER_ENGINE_PER_PASS];
     // array for temporary cv
 
     cv_vec_t pend; // pair로 만들어서 보내기 위함.
 
-    const uint64_t counter_mask = (uint64_t)chunks_per_segment - 1; // M이 2^k라서 마스크로 대체
+    const uint64_t counter_mask = (uint64_t)chunks_per_segment - 1; // S가 2^k라서 마스크로 대체
 
     for (uint64_t p = 0; p < num_passes; p++) {
         for (int i = 0; i < BLOCKS_PER_PE; i++) {
@@ -288,7 +285,7 @@ void comp_pe(hls::stream<internal_pkt>& in_fifo, hls::stream<cv_pair_t>& out_cv_
             #pragma HLS dependence variable=cv_mem type=inter false
             
             internal_pkt pkt = in_fifo.read();
-            uint8_t engine_chunk_idx = pkt.chunk_idx % CHUNKS_PER_ENGINE; // 0~31
+            int pass_local_chunk_idx = pkt.engine_local_chunk_idx % CHUNKS_PER_ENGINE_PER_PASS; // 0~31
             
             uint32_t cv_in[8];
             #pragma HLS ARRAY_PARTITION variable=cv_in complete
@@ -301,7 +298,7 @@ void comp_pe(hls::stream<internal_pkt>& in_fifo, hls::stream<cv_pair_t>& out_cv_
             } else {
                 for (int j = 0; j < 8; j++) {
                 #pragma HLS UNROLL
-                    cv_in[j] = cv_mem[engine_chunk_idx][j];
+                    cv_in[j] = cv_mem[pass_local_chunk_idx][j];
                 }
             }
 
@@ -316,9 +313,9 @@ void comp_pe(hls::stream<internal_pkt>& in_fifo, hls::stream<cv_pair_t>& out_cv_
             uint32_t res16[16];
             #pragma HLS ARRAY_PARTITION variable=res16 complete
 
-            // 변경점: 전역 청크번호 -> 세그먼트 내 counter
-            // 하위 S비트 추출
-            uint64_t seg_counter = pkt.chunk_idx & counter_mask;
+            // 엔진 안 청크번호 -> 세그먼트 내부에서 몇 번째 청크냐(=counter)
+            // 하위 log2(S) 비트 추출
+            uint64_t seg_counter = pkt.engine_local_chunk_idx & counter_mask;
             compress(cv_in, msg, seg_counter, 64, pkt.flags, res16);
 
             cv_vec_t out_cv;
@@ -328,15 +325,9 @@ void comp_pe(hls::stream<internal_pkt>& in_fifo, hls::stream<cv_pair_t>& out_cv_
                 out_cv[j] = res16[j];
             }
 
-            // if (pkt.flags & CHUNK_END) {
-            //     out_cv_fifo.write(out_cv);
-            // } else {
-            //     cv_mem[engine_chunk_idx] = out_cv;
-            // }
-
             if (pkt.flags & CHUNK_END) {
                 // 짝수 청크면 보류, 홀수 청크면 pair로 write
-                if ((pkt.chunk_idx & 1) == 0) {
+                if ((pkt.engine_local_chunk_idx & 1) == 0) {
                     pend = out_cv;
                 } else {
                     cv_pair_t pr;
@@ -345,408 +336,195 @@ void comp_pe(hls::stream<internal_pkt>& in_fifo, hls::stream<cv_pair_t>& out_cv_
                     out_cv_fifo.write(pr);
                 }
             } else {
-                cv_mem[engine_chunk_idx] = out_cv;
+                cv_mem[pass_local_chunk_idx] = out_cv;
             }
         }
     }
 }
 
+void relay_4to1(hls::stream<cv_pair_t>& in_0,
+                hls::stream<cv_pair_t>& in_1,
+                hls::stream<cv_pair_t>& in_2,
+                hls::stream<cv_pair_t>& in_3, 
+                hls::stream<cv_pair_t>& out_fifo,
+                uint64_t num_passes) {
+
+    for (uint64_t p = 0; p < num_passes; p++) {
+        #pragma HLS LOOP_FLATTEN off
+        for (int i = 0; i < PAIRS_PER_RELAY4_PER_PASS; i++) {
+            #pragma HLS PIPELINE II=1
+            int sel = i / PAIRS_PER_ENGINE_PER_PASS; // 16개씩 끊어서 0,1,2,3
+
+            cv_pair_t pr;
+            if      (sel == 0) pr = in_0.read();
+            else if (sel == 1) pr = in_1.read();
+            else if (sel == 2) pr = in_2.read();
+            else               pr = in_3.read(); 
+            out_fifo.write(pr);
+        }
+    }
+}
+
+void relay_2to1(hls::stream<cv_pair_t>& in_0,
+                hls::stream<cv_pair_t>& in_1,
+                hls::stream<cv_pair_t>& out_fifo,
+                uint64_t num_passes) {
+
+    for (uint64_t p = 0; p < num_passes; p++) {
+        #pragma HLS LOOP_FLATTEN off
+        for (int i = 0; i < 2 * PAIRS_PER_RELAY4_PER_PASS; i++) {
+            #pragma HLS PIPELINE II=1
+            cv_pair_t pr;
+            if (i < PAIRS_PER_RELAY4_PER_PASS) pr = in_0.read(); // 엔진 0~3
+            else                               pr = in_1.read(); // 엔진 4~7
+            out_fifo.write(pr);
+        }
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════
-//  cv_pe
+//  cv_pe : 청크 CV 쌍을 BLAKE3 트리로 합쳐 세그먼트 해시를 ext_out 에 쓴다
 //
-//  각 stage 공통 패턴:
-//    span    = 이 stage가 만드는 노드가 덮는 청크 수 = 2^(k+1)
-//    active  = (span <= S)   이 stage를 실행하는가
-//    is_root = (span == S)   이 stage 결과가 곧 세그먼트 루트인가
-//    active가 false면 이후 stage도 자동으로 멈춘다.
+//  레벨 L 노드는 청크 2^(L+1) 개를 덮는다 (L = 0..9). 세그먼트 루트는 레벨 log2(S) - 1.
+//
+//  [규칙 하나] 레벨 L 노드는, 그 노드가 덮는 마지막 pass 가 q 이면 step q+L 에 병합한다.
+//    표의 숫자가 step 이다. 같은 숫자끼리 한 step 에 돌고, 이 대각선이 wavefront 다.
+//
+//            q=0  q=1  q=2  q=3
+//       L0    0    1    2    3
+//       L1    1    2    3    4
+//       L2    2    3    4    5
+//
+//    자식은 항상 지난 step 이전에 끝나 있으므로 한 step 안의 병합끼리는 서로 기다리지 않는다.
+//
+//  [순서] 한 step 은 위 레벨부터 돈다: [L9 .. L5][L4][L3][L2][L1][L0]
+//    위 레벨이 자식 칸의 옛 값을 읽은 뒤에 아래 레벨이 그 칸을 덮어쓴다 (WAR 안전).
+//    안쪽 루프가 step 마다 끝나서 지난 step 의 쓰기는 전부 완료돼 있다 (RAW 안전).
+//    DEPENDENCE false 는 이 두 가지에서 나온다. 레벨 순서를 바꾸거나 step 을 이어 붙이면 깨진다.
+//
+//  [해시 쓰기] L0 는 자식을 FIFO 에서 받아서 tree 읽기 포트가 논다.
+//    그 포트로 지난 step 의 루트를 읽어 ext_out 에 쓴다. 그래서 루트 칸은 step 홀짝으로 두 벌이다.
+//    입력이 끝난 step 은 L0 자리에 해시 쓰기만 남는다.
+//
+//  [tree 배치] 자식 쌍은 항상 붙어 있어서 base + 2*node, base + 2*node + 1 로 한 번에 읽는다.
+//    레벨 0~3 : tree[LV_BASE[L] + node]                  node = pass 안 노드 번호
+//    레벨 4~8 : tree[LV_BASE[L] + 2e + (오른쪽 자식?)]   e = 엔진. step 마다 엔진당 노드 1개
+//    루트     : tree[HASH_BASE + HASH_SLOTS*(p&1) + node]
 // ══════════════════════════════════════════════════════════════════════════
-void cv_pe(hls::stream<cv_pair_t>& in_cv_fifo_0,
-           hls::stream<cv_pair_t>& in_cv_fifo_1,
-           hls::stream<cv_pair_t>& in_cv_fifo_2,
-           hls::stream<cv_pair_t>& in_cv_fifo_3,
-           hls::stream<cv_pair_t>& in_cv_fifo_4,
-           hls::stream<cv_pair_t>& in_cv_fifo_5,
-           hls::stream<cv_pair_t>& in_cv_fifo_6,
-           hls::stream<cv_pair_t>& in_cv_fifo_7,
+void cv_pe(hls::stream<cv_pair_t>& in_cv_fifo,
            cv_vec_t* ext_out,
            uint64_t num_chunks,
            uint64_t num_passes,
            uint32_t chunks_per_segment) {
 
-    // S = 2^segment_log2  (4 <= S <= 1024)
-    uint32_t segment_log2 = 0;
-    for (int bit = 0; bit < 11; bit++) {
+    const int CV_LEVELS  = 10;     // 레벨 0..9 (S=1024 의 루트가 레벨 9)
+    const int PASS_LV    = 4;      // 엔진의 한 pass(32 청크)를 덮는 레벨. 이보다 위 레벨은 여러 pass 에 걸친다
+    const int HASH_BASE  = 320;    // 해시 칸 [2][HASH_SLOTS]
+    const int HASH_SLOTS = 64;     // 한 step 의 해시 최대 개수 (S=4)
+    const int TREE_SLOTS = 456;    // HASH_BASE + 2 * HASH_SLOTS + 여유
+    static const int LV_BASE[CV_LEVELS] = {0, 128, 192, 224, 240, 256, 272, 288, 304, 320};   // [9] 는 안 씀 (레벨 9 는 항상 루트)
+
+    uint32_t seg_log2 = 0;
+    for (int b = 0; b < 11; b++) {
         #pragma HLS UNROLL
-        if (chunks_per_segment & (1u << bit)) segment_log2 = bit;
+        if (chunks_per_segment & (1u << b)) seg_log2 = b;
     }
-    // 엔진 하나가 소유하는 세그먼트 개수 = (num_chunks / S) / NUM_ENGINES
-    const uint64_t segments_per_engine = (num_chunks >> segment_log2) / NUM_ENGINES;
+    const uint32_t segs_per_engine = (uint32_t)((num_chunks >> seg_log2) / NUM_ENGINES);
+    const int      root_lv   = (int)seg_log2 - 1;                                     // 세그먼트 루트 레벨
+    const uint32_t hash_log2 = (seg_log2 <= PASS_LV + 1) ? PASS_LV + 1 - seg_log2 : 0;   // 루트가 나오는 step 의 엔진당 해시 수 = 2^hash_log2
 
-    // 목표가 32 이하라면? -> 1 Pass 돌 때 완성품(해시)이 여러 개 쏟아진다.
-    // 나눗셈(32 / S)을 피하기 위해 비트 시프트로 계산한다.
-    const uint32_t hashes_per_pass_per_engine_log2 = (segment_log2 <= 5) ? (5 - segment_log2) : 0;
-    const uint32_t hashes_per_pass_per_engine      = 1u << hashes_per_pass_per_engine_log2;
-
-    // 목표가 32를 초과한다면? -> 1 Pass로는 택도 없으니 여러 번(Pass) 돌려서 재료를 누적해야 한다.
-    // 한 패스 당 32 크기의 subtree가 완성된다
-    // 나눗셈(S / 32)을 피하기 위해 비트 시프트로 계산한다.
-    const uint32_t passes_needed_per_segment_log2 = (segment_log2 > 5) ? (segment_log2 - 5) : 0;
-    const uint32_t passes_needed_per_segment      = 1u << passes_needed_per_segment_log2;
-
-    // tree_A, B: 32 크기의 subtree를 만들기 위해 사용하는 배열
-    cv_vec_t tree_A[CHUNKS_PER_PASS / 2];
-    cv_vec_t tree_B[CHUNKS_PER_PASS / 4];
-
-    // acc_A, B: S 크기의 subtree를 만들기 위해 사용하는 배열
-    cv_vec_t acc_A[NUM_ENGINES * MAX_SUB];       // 256 : 엔진 e 블록 [e*passes_needed_per_segment, +passes_needed_per_segment)
-                                                 //       = 엔진 e개 x 각 32개 (S 최대 1024청크=1MiB 기준)
-                                                 // 엔진당 32 size subtree를 최대 32개 저장하니까.
-    cv_vec_t acc_B[NUM_ENGINES * MAX_SUB / 2];   // 128
-    // 파티션 없음. [2i],[2i+1] 두 read는 dual-port로 충분하고 write는 반대편
-    // 버퍼로 나가므로 포트 충돌이 없다. 뱅크가 없으니 select mux도 없다.
-
-    uint32_t subtrees_collected = 0;   // acc에 쌓인 서브트리 루트 개수 (4엔진 공통)
-    uint64_t segments_emitted   = 0;   // 엔진당 지금까지 확정된 세그먼트 개수 (S > 32 경로)
-
-    for (uint64_t p = 0; p < num_passes; p++) {
-        
-        // FIFO_0에서 가져오는건 II=2라는거 인지
-        // FIFO_1~7은 II=1
-        for (int i = 0; i < CHUNKS_PER_PASS / 2; i++) {
-            #pragma HLS PIPELINE II=1
-            cv_pair_t in_pair;
-            if      (i < 1 * (CHUNKS_PER_ENGINE / 2)) in_pair = in_cv_fifo_0.read();
-            else if (i < 2 * (CHUNKS_PER_ENGINE / 2)) in_pair = in_cv_fifo_1.read();
-            else if (i < 3 * (CHUNKS_PER_ENGINE / 2)) in_pair = in_cv_fifo_2.read();
-            else if (i < 4 * (CHUNKS_PER_ENGINE / 2)) in_pair = in_cv_fifo_3.read();
-            else if (i < 5 * (CHUNKS_PER_ENGINE / 2)) in_pair = in_cv_fifo_4.read();
-            else if (i < 6 * (CHUNKS_PER_ENGINE / 2)) in_pair = in_cv_fifo_5.read();
-            else if (i < 7 * (CHUNKS_PER_ENGINE / 2)) in_pair = in_cv_fifo_6.read();
-            else                                      in_pair = in_cv_fifo_7.read();
-            cv_vec_t left = in_pair.l, right = in_pair.r, merged;
-            parent_cv(left, right, 0, merged);
-            tree_A[i] = merged;
-        }
-
-        // 아래 tree stage 4개와 acc sub-stage 5개가 공유하는 레벨 파라미터.
-        //   merge_count   : 병합 횟수
-        //   is_root : S 크기까지 subtree가 완성되었나
-        int  merge_count;
-        bool is_root;
-
-        // ── Stage 1 (64 -> 32, span 4 chunks), A read / B write ──
-        is_root = (chunks_per_segment == 4);
-        merge_count   = (4 <= chunks_per_segment) ? (CHUNKS_PER_PASS / 4) : 0;
-        for (int i = 0; i < merge_count; i++) {
-            #pragma HLS PIPELINE II=1
-            cv_vec_t left = tree_A[2*i];
-            cv_vec_t right = tree_A[2*i+1];
-            cv_vec_t merged;
-            parent_cv(left, right, is_root ? ROOT : 0, merged);
-            tree_B[i] = merged;
-        }
-
-        // ── Stage 2 (32 -> 16, span 8 chunks), B read / A write ──
-        is_root = (chunks_per_segment == 8);
-        merge_count   = (8 <= chunks_per_segment) ? (CHUNKS_PER_PASS / 8) : 0;
-        for (int i = 0; i < merge_count; i++) {
-            #pragma HLS PIPELINE II=1
-            cv_vec_t left = tree_B[2*i];
-            cv_vec_t right = tree_B[2*i+1];
-            cv_vec_t merged;
-            parent_cv(left, right, is_root ? ROOT : 0, merged);
-            tree_A[i] = merged;
-        }
-
-        // ── Stage 3 (16 -> 8, span 16 chunks), A read / B write ──
-        is_root = (chunks_per_segment == 16);
-        merge_count   = (16 <= chunks_per_segment) ? (CHUNKS_PER_PASS / 16) : 0;
-        for (int i = 0; i < merge_count; i++) {
-            #pragma HLS PIPELINE II=1
-            cv_vec_t left = tree_A[2*i];
-            cv_vec_t right = tree_A[2*i+1];
-            cv_vec_t merged;
-            parent_cv(left, right, is_root ? ROOT : 0, merged);
-            tree_B[i] = merged;
-        }
-
-        // ── Stage 4 (8 -> 4, span 32 chunks), B read / A write ──
-        //    S == 32 이면 여기가 세그먼트 루트.
-        //    S >  32 이면 flags=0 인 32청크 서브트리 루트가 tree_A[0..3] 에 남는다.
-        is_root = (chunks_per_segment == 32);
-        merge_count   = (32 <= chunks_per_segment) ? (CHUNKS_PER_PASS / 32) : 0;
-        for (int i = 0; i < merge_count; i++) {
-            #pragma HLS PIPELINE II=1
-            cv_vec_t left = tree_B[2*i];
-            cv_vec_t right = tree_B[2*i+1];
-            cv_vec_t merged;
-            parent_cv(left, right, is_root ? ROOT : 0, merged);
-            tree_A[i] = merged;
-        }
-
-        if (chunks_per_segment <= CHUNKS_PER_ENGINE) {
-            // ── (S <= 32) : pass 안에서 세그먼트가 닫혔다 ──
-            //   루트 결과는 엔진 e 블록 [e*hashes_per_pass_per_engine, +hashes_per_pass_per_engine) 에 정렬돼 있다.
-            //   엔진마다 목적지 주소가 연속이라 burst가 잡힌다.
-            //   루트가 A인지 B인지는 stage 개수의 홀짝 = segment_log2의 홀짝.
-            const bool is_root_in_tree_A = ((segment_log2 & 1) == 1);
-            uint64_t out_addr = (uint64_t)p << hashes_per_pass_per_engine_log2;
-            // 패스마다 앞에서 부터 채워짐. ex: p==0이면 0~3칸에, p==1이면 4~7칸에 각 엔진들이 채워넣음
-
-            for (int engine = 0; engine < NUM_ENGINES; engine++) {
-                uint32_t node_base = (uint32_t)engine << hashes_per_pass_per_engine_log2;
-                for (uint32_t j = 0; j < hashes_per_pass_per_engine; j++) {
-                    #pragma HLS PIPELINE II=1
-                    ext_out[out_addr + j] = is_root_in_tree_A ? tree_A[node_base + j] : tree_B[node_base + j];
-                }
-                out_addr += segments_per_engine;
-                // 엔진 단위로 block partitioning 이니까 한 엔진이 맡은 세그먼트들 만큼 건너뛰어야 다음 엔진 세그먼트들이 나옴
-                // 0, 2, 4, 6
-                // 1, 3, 5, 7 이런식으로 채워넣음
-            }
-        } else {
-            // ── pass간 누적 (S > 32) ──
-            //   pass마다 실행이 된다.
-            //   엔진 e의 서브트리 루트를 acc_A[e*passes_needed_per_segment + subtrees_collected] 에 쌓는다.
-            //   stride를 passes_needed_per_segment(2의 거듭제곱)로 두면 acc에서도 (2i, 2i+1)
-            //   평면 스캔이 엔진 경계를 넘지 않는다. tree_A와 같은 논리.
-            for (int engine = 0; engine < NUM_ENGINES; engine++) {
-                #pragma HLS PIPELINE II=1
-                acc_A[((uint32_t)engine << passes_needed_per_segment_log2) + subtrees_collected] = tree_A[engine];
-            }
-            subtrees_collected++;
-            // 0, 4, 8, 12
-            // 1, 5, 9, 13 이렇게 뛰엄뛰엄 되어서 결국 앞에는 engine 0, 그다음은 engine 1 이런 크기 32짜리 subtree(CV)가 엔진별로 모여서 저장
-
-            if (subtrees_collected == passes_needed_per_segment) {
-                // 마지막 pass에서만 실행됨
-                subtrees_collected = 0;
-
-                // sub-stage 0 : acc_A -> acc_B  (엔진당 passes_needed_per_segment/2 노드)
-                is_root = (passes_needed_per_segment == 2);
-                merge_count   = (passes_needed_per_segment >= 2) ? (int)(passes_needed_per_segment >> 1) * NUM_ENGINES : 0;
-                for (int i = 0; i < merge_count; i++) {
-                    #pragma HLS PIPELINE II=1
-                    cv_vec_t left = acc_A[2*i];
-                    cv_vec_t right = acc_A[2*i+1];
-                    cv_vec_t merged;
-                    parent_cv(left, right, is_root ? ROOT : 0, merged);
-                    acc_B[i] = merged;
-                }
-
-                // sub-stage 1 : acc_B -> acc_A
-                is_root = (passes_needed_per_segment == 4);
-                merge_count = (passes_needed_per_segment >= 4) ? (int)(passes_needed_per_segment >> 2) * NUM_ENGINES : 0;
-                for (int i = 0; i < merge_count; i++) {
-                    #pragma HLS PIPELINE II=1
-                    cv_vec_t left = acc_B[2*i];
-                    cv_vec_t right = acc_B[2*i+1];
-                    cv_vec_t merged;
-                    parent_cv(left, right, is_root ? ROOT : 0, merged);
-                    acc_A[i] = merged;
-                }
-
-                // sub-stage 2 : acc_A -> acc_B
-                is_root = (passes_needed_per_segment == 8);
-                merge_count = (passes_needed_per_segment >= 8) ? (int)(passes_needed_per_segment >> 3) * NUM_ENGINES : 0;
-                for (int i = 0; i < merge_count; i++) {
-                    #pragma HLS PIPELINE II=1
-                    cv_vec_t left = acc_A[2*i];
-                    cv_vec_t right = acc_A[2*i+1];
-                    cv_vec_t merged;
-                    parent_cv(left, right, is_root ? ROOT : 0, merged);
-                    acc_B[i] = merged;
-                }
-
-                // sub-stage 3 : acc_B -> acc_A
-                is_root = (passes_needed_per_segment == 16);
-                merge_count = (passes_needed_per_segment >= 16) ? (int)(passes_needed_per_segment >> 4) * NUM_ENGINES : 0;
-                for (int i = 0; i < merge_count; i++) {
-                    #pragma HLS PIPELINE II=1
-                    cv_vec_t left = acc_B[2*i];
-                    cv_vec_t right = acc_B[2*i+1];
-                    cv_vec_t merged; 
-                    parent_cv(left, right, is_root ? ROOT : 0, merged);
-                    acc_A[i] = merged;
-                }
-
-                // sub-stage 4 : acc_A -> acc_B  (MAX_SUB=32의 마지막 단)
-                is_root = (passes_needed_per_segment == 32);
-                merge_count = (passes_needed_per_segment >= 32) ? (int)(passes_needed_per_segment >> 5) * NUM_ENGINES : 0;
-                for (int i = 0; i < merge_count; i++) {
-                    #pragma HLS PIPELINE II=1
-                    cv_vec_t left = acc_A[2*i];
-                    cv_vec_t right = acc_A[2*i+1];
-                    cv_vec_t merged;
-                    parent_cv(left, right, is_root ? ROOT : 0, merged);
-                    acc_B[i] = merged;
-                }
-
-                // ── hash write(S > 32) : 엔진당 세그먼트 1개씩, 총 4개 ──
-                const bool root_in_acc_A = ((passes_needed_per_segment_log2 & 1) == 0);
-                uint64_t out_addr = segments_emitted;
-                for (int engine = 0; engine < NUM_ENGINES; engine++) {
-                    #pragma HLS PIPELINE II=1
-                    ext_out[out_addr] = root_in_acc_A ? acc_A[engine] : acc_B[engine];
-                    out_addr += segments_per_engine;
-                    // burst로 처리가 안됨.
-                }
-                segments_emitted++;
-            }
-        }
+    uint32_t engine_base[NUM_ENGINES];   // 엔진 e 의 해시 구역 시작 = e * segs_per_engine (block 배치)
+    #pragma HLS ARRAY_PARTITION variable=engine_base complete
+    for (int e = 0; e < NUM_ENGINES; e++) {
+        #pragma HLS UNROLL
+        engine_base[e] = e * segs_per_engine;
     }
-    // 이전 버전
-    // for (uint64_t p = 0; p < num_passes; p++) {
-    //     #pragma HLS LOOP_TRIPCOUNT min=1 max=2
 
-    //     cv_vec_t buf_A[CHUNKS_PER_PASS];      // 128
-    //     cv_vec_t buf_B[CHUNKS_PER_PASS / 2];  // 64
-    //     // BRAM의 포트가 2개인데, 압축하다보면 write와 read 2개 동시에 하는 경우가 있기에 이렇게 쪼갬
+    cv_vec_t tree[TREE_SLOTS];
+    #pragma HLS BIND_STORAGE variable=tree type=RAM_1WNR impl=BRAM
 
-    //     for (int i = 0; i < CHUNKS_PER_PASS; i++) {
-    //         #pragma HLS PIPELINE II=1
-            
-    //         if (i < CHUNKS_PER_ENGINE) {
-    //             buf_A[i] = in_cv_fifo_0.read();
-    //         } else if (i < 2 * CHUNKS_PER_ENGINE) {
-    //             buf_A[i] = in_cv_fifo_1.read();
-    //         } else if (i < 3 * CHUNKS_PER_ENGINE) {
-    //             buf_A[i] = in_cv_fifo_2.read();
-    //         } else {
-    //             buf_A[i] = in_cv_fifo_3.read();
-    //         }
-    //     }
+    bool     hash_ready           = false;   // 지난 step 에 루트가 나왔나
+    uint32_t engine_local_seg_idx = 0;       // 다음에 쓸 해시의 엔진 안 세그먼트 번호. 해시는 순서대로 나온다
 
-    //     // ── Stage 0 (128 -> 64), result node size: 2 chunks, A read / B write ──
-    //     bool is_root = (chunks_per_segment == 2);
-    //     int  n = (2 <= chunks_per_segment) ? (CHUNKS_PER_PASS / 2) : 0;
-    //     for (int i = 0; i < n; i++) {
-    //         #pragma HLS PIPELINE II=1
-    //         #pragma HLS LOOP_TRIPCOUNT min=64 max=64
-    //         cv_vec_t merged;
-    //         parent_cv(buf_A[2*i], buf_A[2*i+1], is_root ? ROOT : 0, merged);
-    //         if (is_root) out_cv_fifo.write(merged);
-    //         else         buf_B[i] = merged;
-    //     }
+    for (uint64_t p = 0; p < num_passes + root_lv + 1; p++) {   // p = step 번호. +1 은 마지막 루트를 쓰는 step
+        #pragma HLS LOOP_TRIPCOUNT min=1 max=32
 
-    //     // ── Stage 1 (64 -> 32), result node size: 4 chunks , B read / A write ──
-    //     is_root = (chunks_per_segment == 4);
-    //     n = (4 <= chunks_per_segment) ? (CHUNKS_PER_PASS / 4) : 0;
-    //     for (int i = 0; i < n; i++) {
-    //         #pragma HLS PIPELINE II=1
-    //         #pragma HLS LOOP_TRIPCOUNT min=32 max=32
-    //         cv_vec_t merged;
-    //         parent_cv(buf_B[2*i], buf_B[2*i+1], is_root ? ROOT : 0, merged);
-    //         if (is_root) out_cv_fifo.write(merged);
-    //         else         buf_A[i] = merged;
-    //     }
+        // ── 1. 계획: 규칙에 맞는 레벨을 찾아 레벨별 iteration 구간을 정한다 ──
+        int  lv_start[CV_LEVELS];   // 레벨 L 구간의 시작 iteration
+        bool is_right[CV_LEVELS];   // 레벨 L 이 이번에 만드는 노드가 부모의 오른쪽 자식인가
+        #pragma HLS ARRAY_PARTITION variable=lv_start complete
+        #pragma HLS ARRAY_PARTITION variable=is_right complete
+        int  num_merge = 0;
+        bool has_leaf  = false;     // 이번 step 에 FIFO 입력이 있나
+        bool has_root  = false;     // 이번 step 에 루트가 나오나
+        for (int L = CV_LEVELS - 1; L >= 0; L--) {
+            #pragma HLS UNROLL
+            const int  end_pass  = (int)p - L + 1;                             // 규칙에서 q + 1
+            const int  span_log2 = (L > PASS_LV) ? L - PASS_LV : 0;            // 노드 하나가 덮는 pass 수 = 2^span_log2
+            const bool in_range  = (end_pass >= 1) && (end_pass <= (int)num_passes);
+            const bool span_done = (end_pass & ((1 << span_log2) - 1)) == 0;   // 노드가 덮는 마지막 pass 인가
+            const bool active    = (L <= root_lv) && in_range && span_done;
 
-    //     // ── Stage 2 (32 -> 16), result node size: 8 chunks, A read / B write ──
-    //     is_root = (chunks_per_segment == 8);
-    //     n = (8 <= chunks_per_segment) ? (CHUNKS_PER_PASS / 8) : 0;
-    //     for (int i = 0; i < n; i++) {
-    //         #pragma HLS PIPELINE II=1
-    //         #pragma HLS LOOP_TRIPCOUNT min=16 max=16
-    //         cv_vec_t merged;
-    //         parent_cv(buf_A[2*i], buf_A[2*i+1], is_root ? ROOT : 0, merged);
-    //         if (is_root) out_cv_fifo.write(merged);
-    //         else         buf_B[i] = merged;
-    //     }
- 
-    //     // ── Stage 3 (16 -> 8), result node size: 16 chunks, B read / A write ──
-    //     is_root = (chunks_per_segment == 16);
-    //     n = (16 <= chunks_per_segment) ? (CHUNKS_PER_PASS / 16) : 0;
-    //     for (int i = 0; i < n; i++) {
-    //         #pragma HLS PIPELINE II=1
-    //         #pragma HLS LOOP_TRIPCOUNT min=8 max=8
-    //         cv_vec_t merged;
-    //         parent_cv(buf_B[2*i], buf_B[2*i+1], is_root ? ROOT : 0, merged);
-    //         if (is_root) out_cv_fifo.write(merged);
-    //         else         buf_A[i] = merged;
-    //     }
+            lv_start[L] = num_merge;
+            is_right[L] = ((end_pass >> span_log2) & 1) == 0;                  // 노드 번호 (end_pass >> span_log2) - 1 이 홀수
+            if (active) num_merge += (L <= PASS_LV) ? ((CHUNKS_PER_PASS / 2) >> L) : NUM_ENGINES;
+            if (active && L == 0)       has_leaf = true;
+            if (active && L == root_lv) has_root = true;
+        }
+        const int num_hash = hash_ready ? (NUM_ENGINES << hash_log2) : 0;
+        const int num_iter = has_leaf ? num_merge : num_merge + num_hash;   // 입력이 끝난 step 은 L0 자리에 해시 쓰기만
+        const int hash_rd_base = HASH_BASE + HASH_SLOTS * ((p - 1) & 1);    // 지난 step 의 루트 칸
+        const int hash_wr_base = HASH_BASE + HASH_SLOTS * (p & 1);          // 이번 step 의 루트 칸
 
-    //     // ── Stage 4 (8 -> 4), result node size: 32 chunks, A read / B write ──
-    //     is_root = (chunks_per_segment == 32);
-    //     n = (32 <= chunks_per_segment) ? (CHUNKS_PER_PASS / 32) : 0;
-    //     for (int i = 0; i < n; i++) {
-    //         #pragma HLS PIPELINE II=1
-    //         #pragma HLS LOOP_TRIPCOUNT min=4 max=4
-    //         cv_vec_t merged;
-    //         parent_cv(buf_A[2*i], buf_A[2*i+1], is_root ? ROOT : 0, merged);
-    //         if (is_root) out_cv_fifo.write(merged);
-    //         else         buf_B[i] = merged;
-    //     }
+        // ── 2. 실행: 이번 step 의 노드를 위 레벨부터 쉬지 않고 발행한다 ──
+        for (int i = 0; i < num_iter; i++) {
+            #pragma HLS PIPELINE II=1
+            #pragma HLS LOOP_TRIPCOUNT min=1 max=264
+            #pragma HLS DEPENDENCE variable=tree type=inter false
 
-    //     // ── Stage 5 (4 -> 2), result node size: 64 chunks, B read / A write ──
-    //     is_root = (chunks_per_segment == 64);
-    //     n = (64 <= chunks_per_segment) ? (CHUNKS_PER_PASS / 64) : 0;
-    //     for (int i = 0; i < n; i++) {
-    //         #pragma HLS PIPELINE II=1
-    //         #pragma HLS LOOP_TRIPCOUNT min=2 max=2
-    //         cv_vec_t merged;
-    //         parent_cv(buf_B[2*i], buf_B[2*i+1], is_root ? ROOT : 0, merged);
-    //         if (is_root) out_cv_fifo.write(merged);
-    //         else         buf_A[i] = merged;
-    //     }
+            // i 번째 iteration 이 맡은 노드 = 레벨 L 의 node 번
+            int L = CV_LEVELS - 1;
+            for (int k = CV_LEVELS - 1; k >= 0; k--) {
+                #pragma HLS UNROLL
+                if (i >= lv_start[k]) L = k;
+            }
+            const int  node    = i - lv_start[L];
+            const bool is_leaf = (L == 0) && has_leaf;
+            const bool is_hash = (L == 0) && (node < num_hash);
+            const bool is_root = (L == root_lv);
 
-    //     // ── Stage 6 (2 -> 1), result node size: 128 chunks, A read / 출력 ──  [v2 신규]
-    //     //   S == 128 이면 이 노드가 세그먼트 루트 → ROOT
-    //     //   S >  128 이면 flags=0인 128청크짜리 서브트리 루트를 뱉는다.
-    //     //              (pass간 병합은 cv_pe_final 몫 — 2단계에서 구현)
-    //     // 지금은 segment가 128KiB 까지 인것만 구현한 것
-    //     is_root = (chunks_per_segment == 128);
-    //     n = (128 <= chunks_per_segment) ? 1 : 0;
-    //     for (int i = 0; i < n; i++) {
-    //         #pragma HLS PIPELINE II=1
-    //         #pragma HLS LOOP_TRIPCOUNT min=1 max=1
-    //         cv_vec_t merged;
-    //         parent_cv(buf_A[2*i], buf_A[2*i+1], is_root ? ROOT : 0, merged);
-    //         out_cv_fifo.write(merged);
-    //     }
-    // }
+            // tree 읽기: 병합이면 자식 쌍, L0 이면 지난 step 의 해시
+            int rd_addr = 0;
+            if (L != 0)       rd_addr = LV_BASE[L - 1] + 2 * node;
+            else if (is_hash) rd_addr = hash_rd_base + node;
+            const cv_vec_t tree_l = tree[rd_addr];
+            const cv_vec_t tree_r = tree[rd_addr + 1];
+
+            // FIFO 읽기 뒤에 해시 쓰기를 둔다. 순서를 바꾸면 FF 가 약 1K 늘어난다 (csynth 확인)
+            cv_vec_t left = tree_l, right = tree_r, merged;
+            if (is_leaf) {
+                const cv_pair_t in_pair = in_cv_fifo.read();
+                left  = in_pair.l;
+                right = in_pair.r;
+            }
+            const int hash_engine = node >> hash_log2;               // 이 해시를 만든 엔진
+            const int hash_in_eng = node & ((1 << hash_log2) - 1);   // 그 엔진의 이번 step 해시 중 몇 번째
+            if (is_hash) ext_out[engine_base[hash_engine] + engine_local_seg_idx + hash_in_eng] = tree_l;
+
+            // 병합. parent_cv 호출은 이 한 곳뿐이어야 compress 코어가 1개만 만들어진다
+            parent_cv(left, right, is_root ? ROOT : 0, merged);
+
+            const int wr_addr = is_root       ? hash_wr_base + node
+                              : (L < PASS_LV) ? LV_BASE[L] + node
+                              :                 LV_BASE[L] + 2 * node + (int)is_right[L];
+            if (L != 0 || is_leaf) tree[wr_addr] = merged;   // 해시만 쓰는 iteration 은 저장할 결과가 없다
+        }
+
+        // ── 3. 뒷정리: 이번 step 에 쓴 해시만큼 번호를 넘기고, 나온 루트는 다음 step 이 쓴다 ──
+        if (hash_ready) engine_local_seg_idx += 1u << hash_log2;
+        hash_ready = has_root;
+    }
 }
-
-// // ══════════════════════════════════════════════════════════════════════════
-// //  cv_pe_final 
-// //
-// //  S <= 128 이면 cv_pe가 이미 ROOT까지 찍어서 뱉으므로, 여기서는 그냥 받아 쓰기만 한다.
-// //  기존 CV 스택(가변 길이 while 루프)은 전부 불필요.
-// //
-// //  [2단계 확장 지점] S > 128 지원 시
-// //    passes_per_segment = S/128 개의 서브트리 루트를 모아 완전이진 병합 후 ROOT 부여.
-// // ══════════════════════════════════════════════════════════════════════════
-// void cv_final_pe(hls::stream<cv_vec_t>& in_cv_fifo, 
-//                  uint64_t num_passes, 
-//                  uint32_t chunks_per_segment,
-//                  cv_vec_t* ext_out) {
-
-//     // chunks_per_segment(S)는 항상 2의 거듭제곱(4~128)이므로 나눗셈 대신
-//     // log2(S)를 우선순위 인코더로 구해 shift로 대체한다. (DSP divider 회피, LUT만 사용)
-//     // const uint32_t hashes_per_pass = (uint32_t)CHUNKS_PER_PASS / chunks_per_segment;
-//     uint32_t seg_log2 = 0;
-//     for (int b = 0; b < 8; b++) {
-//         #pragma HLS UNROLL
-//         if (chunks_per_segment & (1u << b)) seg_log2 = b;
-//     }
-//     const uint32_t hashes_per_pass = (uint32_t)CHUNKS_PER_PASS >> seg_log2;
-
-
-
-//     uint64_t k = 0;
-//     for (uint64_t p = 0; p < num_passes; p++) {
-//         #pragma HLS LOOP_TRIPCOUNT min=1 max=2
-//         #pragma HLS LOOP_FLATTEN off
-//         // flatten을 켜두면 outer(p)/inner(j) 인덱스를 합치는 과정에서
-//         // hashes_per_pass(런타임 값)와의 곱셈이 생겨 DSP를 다시 잡아먹는다.
-//         for (uint32_t j = 0; j < hashes_per_pass; j++) {
-//             #pragma HLS PIPELINE II=1
-//             #pragma HLS LOOP_TRIPCOUNT min=1 max=32
-//             // chunks_per_segment가 4일때, 가장 많은 해쉬가 나오는데 그게 32개
-//             ext_out[k] = in_cv_fifo.read();
-//             k++;
-//         }
-//     }
-// }
 
 void blake3_accelerator(const block_vec_t* host_data_in_0,
             const block_vec_t* host_data_in_1,
@@ -758,7 +536,7 @@ void blake3_accelerator(const block_vec_t* host_data_in_0,
             const block_vec_t* host_data_in_7,
             cv_vec_t* host_hash_out,
             uint64_t  num_chunks,
-            uint32_t  chunks_per_segment) {
+            uint32_t  chunks_per_segment) { 
     #pragma HLS INTERFACE m_axi port=host_data_in_0 bundle=gmem0
     #pragma HLS INTERFACE m_axi port=host_data_in_1 bundle=gmem1
     #pragma HLS INTERFACE m_axi port=host_data_in_2 bundle=gmem2
@@ -770,7 +548,6 @@ void blake3_accelerator(const block_vec_t* host_data_in_0,
     #pragma HLS INTERFACE m_axi port=host_hash_out  bundle=gmem8
 
     uint64_t num_passes = num_chunks / CHUNKS_PER_PASS;
-    uint64_t chunks_per_engine_total = num_chunks / NUM_ENGINES;
 
     hls::stream<internal_pkt> disp_to_comp_0("disp_to_comp_0");
     hls::stream<internal_pkt> disp_to_comp_1("disp_to_comp_1");
@@ -790,101 +567,56 @@ void blake3_accelerator(const block_vec_t* host_data_in_0,
     #pragma HLS STREAM variable=disp_to_comp_6 depth=FIFO_DEPTH_D2C
     #pragma HLS STREAM variable=disp_to_comp_7 depth=FIFO_DEPTH_D2C
 
-    hls::stream<cv_pair_t> comp_to_cv_0("comp_to_cv_0");
-    hls::stream<cv_pair_t> comp_to_cv_1("comp_to_cv_1");
-    hls::stream<cv_pair_t> comp_to_cv_2("comp_to_cv_2");
-    hls::stream<cv_pair_t> comp_to_cv_3("comp_to_cv_3");
-    hls::stream<cv_pair_t> comp_to_cv_4("comp_to_cv_4");
-    hls::stream<cv_pair_t> comp_to_cv_5("comp_to_cv_5");
-    hls::stream<cv_pair_t> comp_to_cv_6("comp_to_cv_6");
-    hls::stream<cv_pair_t> comp_to_cv_7("comp_to_cv_7");
+    hls::stream<cv_pair_t> comp_to_relay_0("comp_to_relay_0");
+    hls::stream<cv_pair_t> comp_to_relay_1("comp_to_relay_1");
+    hls::stream<cv_pair_t> comp_to_relay_2("comp_to_relay_2");
+    hls::stream<cv_pair_t> comp_to_relay_3("comp_to_relay_3");
+    hls::stream<cv_pair_t> comp_to_relay_4("comp_to_relay_4");
+    hls::stream<cv_pair_t> comp_to_relay_5("comp_to_relay_5");
+    hls::stream<cv_pair_t> comp_to_relay_6("comp_to_relay_6");
+    hls::stream<cv_pair_t> comp_to_relay_7("comp_to_relay_7");
 
-    #pragma HLS STREAM variable=comp_to_cv_0 depth=FIFO_DEPTH_C2CV
-    #pragma HLS STREAM variable=comp_to_cv_1 depth=FIFO_DEPTH_C2CV
-    #pragma HLS STREAM variable=comp_to_cv_2 depth=FIFO_DEPTH_C2CV
-    #pragma HLS STREAM variable=comp_to_cv_3 depth=FIFO_DEPTH_C2CV
-    #pragma HLS STREAM variable=comp_to_cv_4 depth=FIFO_DEPTH_C2CV
-    #pragma HLS STREAM variable=comp_to_cv_5 depth=FIFO_DEPTH_C2CV
-    #pragma HLS STREAM variable=comp_to_cv_6 depth=FIFO_DEPTH_C2CV
-    #pragma HLS STREAM variable=comp_to_cv_7 depth=FIFO_DEPTH_C2CV
+    #pragma HLS STREAM variable=comp_to_relay_0 depth=FIFO_DEPTH_C2R
+    #pragma HLS STREAM variable=comp_to_relay_1 depth=FIFO_DEPTH_C2R
+    #pragma HLS STREAM variable=comp_to_relay_2 depth=FIFO_DEPTH_C2R
+    #pragma HLS STREAM variable=comp_to_relay_3 depth=FIFO_DEPTH_C2R
+    #pragma HLS STREAM variable=comp_to_relay_4 depth=FIFO_DEPTH_C2R
+    #pragma HLS STREAM variable=comp_to_relay_5 depth=FIFO_DEPTH_C2R
+    #pragma HLS STREAM variable=comp_to_relay_6 depth=FIFO_DEPTH_C2R
+    #pragma HLS STREAM variable=comp_to_relay_7 depth=FIFO_DEPTH_C2R
+
+    hls::stream<cv_pair_t> relay_a4_to_r2("relay_a4_to_r2");
+    hls::stream<cv_pair_t> relay_b4_to_r2("relay_b4_to_r2");
+    hls::stream<cv_pair_t> relay_r2_to_cv("relay_r2_to_cv");
+
+    #pragma HLS STREAM variable=relay_a4_to_r2  depth=FIFO_DEPTH_R2R
+    #pragma HLS STREAM variable=relay_b4_to_r2  depth=FIFO_DEPTH_R2R
+    #pragma HLS STREAM variable=relay_r2_to_cv depth=FIFO_DEPTH_R2CV
 
     #pragma HLS DATAFLOW
-    dispatcher_pe(host_data_in_0, disp_to_comp_0, 0 * chunks_per_engine_total, num_passes);
-    dispatcher_pe(host_data_in_1, disp_to_comp_1, 1 * chunks_per_engine_total, num_passes);
-    dispatcher_pe(host_data_in_2, disp_to_comp_2, 2 * chunks_per_engine_total, num_passes);
-    dispatcher_pe(host_data_in_3, disp_to_comp_3, 3 * chunks_per_engine_total, num_passes);
-    dispatcher_pe(host_data_in_4, disp_to_comp_4, 4 * chunks_per_engine_total, num_passes);
-    dispatcher_pe(host_data_in_5, disp_to_comp_5, 5 * chunks_per_engine_total, num_passes);
-    dispatcher_pe(host_data_in_6, disp_to_comp_6, 6 * chunks_per_engine_total, num_passes);
-    dispatcher_pe(host_data_in_7, disp_to_comp_7, 7 * chunks_per_engine_total, num_passes);
-    // 여기서 2의 배수 연산을 하지 않는 곱셈에 대해서 1사이클씩 밀린다. 1사이클을 곱셈에 사용해서.
-    // 나중에 chunks_per_engine_total을 없애버릴수도 있다. 일단은 놔두기
+    dispatcher_pe(host_data_in_0, disp_to_comp_0, num_passes);
+    dispatcher_pe(host_data_in_1, disp_to_comp_1, num_passes);
+    dispatcher_pe(host_data_in_2, disp_to_comp_2, num_passes);
+    dispatcher_pe(host_data_in_3, disp_to_comp_3, num_passes); 
+    dispatcher_pe(host_data_in_4, disp_to_comp_4, num_passes);
+    dispatcher_pe(host_data_in_5, disp_to_comp_5, num_passes);
+    dispatcher_pe(host_data_in_6, disp_to_comp_6, num_passes);
+    dispatcher_pe(host_data_in_7, disp_to_comp_7, num_passes);
 
-    comp_pe(disp_to_comp_0, comp_to_cv_0, num_passes, chunks_per_segment);
-    comp_pe(disp_to_comp_1, comp_to_cv_1, num_passes, chunks_per_segment);
-    comp_pe(disp_to_comp_2, comp_to_cv_2, num_passes, chunks_per_segment);
-    comp_pe(disp_to_comp_3, comp_to_cv_3, num_passes, chunks_per_segment);
-    comp_pe(disp_to_comp_4, comp_to_cv_4, num_passes, chunks_per_segment);
-    comp_pe(disp_to_comp_5, comp_to_cv_5, num_passes, chunks_per_segment);
-    comp_pe(disp_to_comp_6, comp_to_cv_6, num_passes, chunks_per_segment);
-    comp_pe(disp_to_comp_7, comp_to_cv_7, num_passes, chunks_per_segment);
+    comp_pe(disp_to_comp_0, comp_to_relay_0, num_passes, chunks_per_segment);
+    comp_pe(disp_to_comp_1, comp_to_relay_1, num_passes, chunks_per_segment);
+    comp_pe(disp_to_comp_2, comp_to_relay_2, num_passes, chunks_per_segment);
+    comp_pe(disp_to_comp_3, comp_to_relay_3, num_passes, chunks_per_segment);
+    comp_pe(disp_to_comp_4, comp_to_relay_4, num_passes, chunks_per_segment);
+    comp_pe(disp_to_comp_5, comp_to_relay_5, num_passes, chunks_per_segment);
+    comp_pe(disp_to_comp_6, comp_to_relay_6, num_passes, chunks_per_segment);
+    comp_pe(disp_to_comp_7, comp_to_relay_7, num_passes, chunks_per_segment);
 
-    cv_pe(comp_to_cv_0, comp_to_cv_1, comp_to_cv_2, comp_to_cv_3,
-          comp_to_cv_4, comp_to_cv_5, comp_to_cv_6, comp_to_cv_7,
-          host_hash_out, num_chunks, num_passes, chunks_per_segment);
-} 
+    relay_4to1(comp_to_relay_0, comp_to_relay_1, comp_to_relay_2, comp_to_relay_3,
+               relay_a4_to_r2, num_passes);
+    relay_4to1(comp_to_relay_4, comp_to_relay_5, comp_to_relay_6, comp_to_relay_7,
+               relay_b4_to_r2, num_passes);
+    relay_2to1(relay_a4_to_r2, relay_b4_to_r2, relay_r2_to_cv, num_passes);
 
-// void blake3_accelerator(const block_vec_t* host_data_in_0,
-//             const block_vec_t* host_data_in_1,
-//             const block_vec_t* host_data_in_2,
-//             const block_vec_t* host_data_in_3,
-//             cv_vec_t* host_hash_out,
-//             uint64_t  num_chunks,
-//             uint32_t  chunks_per_segment) {
-//     #pragma HLS INTERFACE m_axi port=host_data_in_0 bundle=gmem0
-//     #pragma HLS INTERFACE m_axi port=host_data_in_1 bundle=gmem1
-//     #pragma HLS INTERFACE m_axi port=host_data_in_2 bundle=gmem2
-//     #pragma HLS INTERFACE m_axi port=host_data_in_3 bundle=gmem3
-//     #pragma HLS INTERFACE m_axi port=host_hash_out bundle=gmem4
-
-//     uint64_t num_passes = num_chunks / CHUNKS_PER_PASS;
-
-//     hls::stream<internal_pkt> disp_to_comp_0("disp_to_comp_0");
-//     hls::stream<internal_pkt> disp_to_comp_1("disp_to_comp_1");
-//     hls::stream<internal_pkt> disp_to_comp_2("disp_to_comp_2");
-//     hls::stream<internal_pkt> disp_to_comp_3("disp_to_comp_3");
-
-//     #pragma HLS STREAM variable=disp_to_comp_0 depth=FIFO_DEPTH_D2C
-//     #pragma HLS STREAM variable=disp_to_comp_1 depth=FIFO_DEPTH_D2C
-//     #pragma HLS STREAM variable=disp_to_comp_2 depth=FIFO_DEPTH_D2C
-//     #pragma HLS STREAM variable=disp_to_comp_3 depth=FIFO_DEPTH_D2C
-
-//     hls::stream<cv_vec_t> comp_to_cv_0("comp_to_cv_0");
-//     hls::stream<cv_vec_t> comp_to_cv_1("comp_to_cv_1");
-//     hls::stream<cv_vec_t> comp_to_cv_2("comp_to_cv_2");
-//     hls::stream<cv_vec_t> comp_to_cv_3("comp_to_cv_3");
-
-//     #pragma HLS STREAM variable=comp_to_cv_0 depth=FIFO_DEPTH_C2CV
-//     #pragma HLS STREAM variable=comp_to_cv_1 depth=FIFO_DEPTH_C2CV
-//     #pragma HLS STREAM variable=comp_to_cv_2 depth=FIFO_DEPTH_C2CV
-//     #pragma HLS STREAM variable=comp_to_cv_3 depth=FIFO_DEPTH_C2CV
-
-//     hls::stream<cv_vec_t> cv_pe_to_cv_final("cv_pe_to_cv_final");
-//     #pragma HLS STREAM variable=cv_pe_to_cv_final depth=FIFO_DEPTH_CV2FINAL
-
-//     #pragma HLS DATAFLOW
-//     dispatcher_pe(host_data_in_0, disp_to_comp_0, 0 * CHUNKS_PER_ENGINE, num_passes);
-//     dispatcher_pe(host_data_in_1, disp_to_comp_1, 1 * CHUNKS_PER_ENGINE, num_passes);
-//     dispatcher_pe(host_data_in_2, disp_to_comp_2, 2 * CHUNKS_PER_ENGINE, num_passes);
-//     dispatcher_pe(host_data_in_3, disp_to_comp_3, 3 * CHUNKS_PER_ENGINE, num_passes);
-
-//     comp_pe(disp_to_comp_0, comp_to_cv_0, num_passes, chunks_per_segment);
-//     comp_pe(disp_to_comp_1, comp_to_cv_1, num_passes, chunks_per_segment);
-//     comp_pe(disp_to_comp_2, comp_to_cv_2, num_passes, chunks_per_segment);
-//     comp_pe(disp_to_comp_3, comp_to_cv_3, num_passes, chunks_per_segment);
-
-//     cv_pe(comp_to_cv_0, comp_to_cv_1, comp_to_cv_2, comp_to_cv_3,
-//           cv_pe_to_cv_final, num_passes, chunks_per_segment);
-
-//     cv_final_pe(cv_pe_to_cv_final, num_passes, chunks_per_segment, host_hash_out);
-// } 
+    cv_pe(relay_r2_to_cv, host_hash_out, num_chunks, num_passes, chunks_per_segment);
+}
