@@ -83,7 +83,7 @@ VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_data_in_5:HBM[5]
 VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_data_in_6:HBM[6]
 VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_data_in_7:HBM[7]
 VPP_LDFLAGS += --connectivity.sp blake3_accelerator_1.host_hash_out:HBM[8]
-VPP_LDFLAGS += --connectivity.slr blake3_accelerator_1:SLR1
+# VPP_LDFLAGS += --connectivity.slr blake3_accelerator_1:SLR1
 
 ############################## Implementation Strategy ##############################
 # --kernel_frequency 써도 오류땜에 안먹는듯 (tmp/run_102p8MHz_.../NOTE.md 참조)
